@@ -54,6 +54,7 @@ class CollectorConfig:
     min_liquidity: float = 0.0
     max_pages: int = 6
     paper: Optional[PaperConfig] = None
+    pandascore_enabled: bool = False
     pandascore_token: str = ""
     sports_ws_enabled: bool = True
     sports_ws_url: str = SPORTS_WS_URL
@@ -257,7 +258,7 @@ def run_cycle(
 
     live_by_provider: Dict[str, Dict[str, Any]] = {}
     panda: Optional[PandaScoreClient] = None
-    if settings.pandascore_token:
+    if settings.pandascore_enabled and settings.pandascore_token:
         try:
             panda = PandaScoreClient(settings.pandascore_token)
             for match in panda.running_matches():
@@ -356,7 +357,11 @@ def run_cycle(
     if (
         ROUND_FEED_NOTICE in result.notices
         and (sports is None or not sports.connected)
-        and (not settings.pandascore_token or not gate.open)
+        and (
+            not settings.pandascore_enabled
+            or not settings.pandascore_token
+            or not gate.open
+        )
     ):
         persisted_notices.append(MAPS_ONLY_NOTICE)
     persisted_notices.extend(result.notices)

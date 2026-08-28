@@ -38,6 +38,7 @@ services:
       TZ: UTC
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
+      PANDASCORE_ENABLED: "${PANDASCORE_ENABLED:-false}"
       PANDASCORE_TOKEN: "${PANDASCORE_TOKEN:-}"
     cap_drop:
       - ALL

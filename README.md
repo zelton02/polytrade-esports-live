@@ -83,9 +83,12 @@ The service sometimes emits `000-000` as an explicit unavailable-rounds
 placeholder (a real map-opening score is `0-0`). Those snapshots still improve
 the map score, but remain maps-only and do not unlock new in-play entries.
 
-Set the PandaScore token and confirm what the plan actually exposes:
+PandaScore is disabled by default. Runtime configuration lives in `.env`
+(`.env.example` is the tracked template). To enable it temporarily as a
+fallback, set both values and confirm what the plan actually exposes:
 
 ```bash
+export PANDASCORE_ENABLED=true
 export PANDASCORE_TOKEN=...
 python3 -m polytrade_esports pandascore-probe
 ```

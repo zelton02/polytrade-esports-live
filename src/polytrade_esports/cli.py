@@ -30,6 +30,19 @@ from .types import BookQuote, LiveState, Match
 
 DEFAULT_DB = os.environ.get("POLYTRADE_ESPORTS_DB", "data/esports_live.sqlite3")
 PANDASCORE_TOKEN_ENV = "PANDASCORE_TOKEN"
+PANDASCORE_ENABLED_ENV = "PANDASCORE_ENABLED"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return bool(default)
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("%s must be true or false" % name)
 
 
 def _print(value: Any) -> None:
@@ -269,6 +282,7 @@ def _collector_config(args: argparse.Namespace) -> CollectorConfig:
         min_liquidity=args.min_liquidity,
         max_pages=args.max_pages,
         paper=_paper_config(args),
+        pandascore_enabled=_env_flag(PANDASCORE_ENABLED_ENV, False),
         pandascore_token=os.environ.get(PANDASCORE_TOKEN_ENV, ""),
         sports_ws_enabled=args.sports_ws_enabled,
         sports_ws_url=args.sports_ws_url,

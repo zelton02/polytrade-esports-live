@@ -369,6 +369,31 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(len(result.errors), 1)
         self.assertIn("book unavailable", result.errors[0])
 
+    def test_disabled_pandascore_never_constructs_a_client_even_with_a_token(self):
+        calls = []
+        original = collector_module.PandaScoreClient
+
+        def unexpected_client(token):
+            calls.append(token)
+            raise AssertionError("disabled PandaScore must not be called")
+
+        collector_module.PandaScoreClient = unexpected_client
+        try:
+            result = run_cycle(
+                self.db,
+                CollectorConfig(
+                    pandascore_enabled=False,
+                    pandascore_token="retained-for-later",
+                ),
+                gamma=FakeGamma([live_event()]),
+                books=FakeBooks(),
+            )
+        finally:
+            collector_module.PandaScoreClient = original
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result.errors, [])
+
     def test_plan_gated_game_detail_is_requested_once_then_dropped(self):
         # Free-tier PandaScore refuses /csgo/games/{id}. Retrying it on every
         # live match every cycle would burn the request quota for nothing.
@@ -403,7 +428,10 @@ class CollectorTests(unittest.TestCase):
         original = collector_module.PandaScoreClient
         collector_module.PandaScoreClient = lambda token: panda
         try:
-            config = CollectorConfig(pandascore_token="x")
+            config = CollectorConfig(
+                pandascore_enabled=True,
+                pandascore_token="x",
+            )
             gamma = FakeGamma([live_event()])
             first = run_cycle(self.db, config, gamma=gamma, books=FakeBooks())
             second = run_cycle(self.db, config, gamma=gamma, books=FakeBooks())
@@ -466,7 +494,7 @@ class CollectorTests(unittest.TestCase):
         try:
             run_cycle(
                 self.db,
-                CollectorConfig(pandascore_token="x"),
+                CollectorConfig(pandascore_enabled=True, pandascore_token="x"),
                 gamma=FakeGamma([live_event()]),
                 books=FakeBooks(),
             )
@@ -526,7 +554,7 @@ class CollectorTests(unittest.TestCase):
         try:
             run_cycle(
                 self.db,
-                CollectorConfig(pandascore_token="x"),
+                CollectorConfig(pandascore_enabled=True, pandascore_token="x"),
                 gamma=FakeGamma([live_event()]),
                 books=FakeBooks(),
                 sports=FakeMapsOnlySports(),
