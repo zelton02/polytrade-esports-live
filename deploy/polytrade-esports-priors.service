@@ -1,0 +1,26 @@
+[Unit]
+Description=Polytrade Esports LLM pre-match priors (read-only research)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/polytrade-esports-live
+Environment=PYTHONPATH=/opt/polytrade-esports-live/src
+ExecStart=/usr/bin/python3 -m polytrade_esports forecast-priors --db /opt/polytrade-esports-live/data/esports_live.sqlite3 --limit 2 --daily-limit 10 --monthly-budget-usd 6 --max-cost-per-forecast 0.10 --min-liquidity 2000
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/polytrade-esports-live/data /root/.hermes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

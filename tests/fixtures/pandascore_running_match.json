@@ -1,0 +1,73 @@
+{
+  "begin_at": "2026-08-28T08:02:25Z",
+  "games": [
+    {
+      "begin_at": "2026-08-28T08:02:33Z",
+      "complete": true,
+      "end_at": "2026-08-28T08:39:39Z",
+      "id": 226017,
+      "match_id": 1630715,
+      "position": 1,
+      "status": "finished",
+      "winner": {
+        "id": 138974,
+        "type": "Team"
+      }
+    },
+    {
+      "begin_at": "2026-08-28T08:56:00Z",
+      "complete": false,
+      "end_at": null,
+      "id": 226018,
+      "match_id": 1630715,
+      "position": 2,
+      "status": "running",
+      "winner": {
+        "id": null,
+        "type": "Team"
+      }
+    },
+    {
+      "begin_at": null,
+      "complete": false,
+      "end_at": null,
+      "id": 226019,
+      "match_id": 1630715,
+      "position": 3,
+      "status": "not_started",
+      "winner": {
+        "id": null,
+        "type": "Team"
+      }
+    }
+  ],
+  "id": 1630715,
+  "modified_at": "2026-08-28T08:56:00Z",
+  "number_of_games": 3,
+  "opponents": [
+    {
+      "opponent": {
+        "id": 131010,
+        "name": "Sashi Esport"
+      }
+    },
+    {
+      "opponent": {
+        "id": 138974,
+        "name": "ex-RUSTEC"
+      }
+    }
+  ],
+  "results": [
+    {
+      "score": 0,
+      "team_id": 131010
+    },
+    {
+      "score": 1,
+      "team_id": 138974
+    }
+  ],
+  "slug": "2026-08-28-cfd77014-b9af-4455-94ba-1da32c3e38ac",
+  "status": "running"
+}

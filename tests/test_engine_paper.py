@@ -1,0 +1,68 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from polytrade_esports.engine import tick
+from polytrade_esports.storage import Database
+from polytrade_esports.types import BookQuote, LiveState, Match
+
+
+STAMP = "2026-08-27T00:00:00Z"
+
+
+class EnginePaperTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.temp.name) / "paper.sqlite3"))
+        self.db.initialize()
+        self.db.add_match(Match("m1", "A", "B", 3, 0.70))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_entry_is_capped_at_one_percent(self):
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        result = tick(self.db, state, quote)
+        self.assertEqual(result["paper_actions"][0]["action"], "BUY")
+        account = self.db.account_payload()
+        spent = 1000.0 - account["cash"]
+        self.assertLessEqual(spent, 10.0 + 1e-8)
+
+    def test_no_entry_without_required_edge(self):
+        self.db.add_match(Match("m2", "C", "D", 3, 0.50))
+        state = LiveState("m2", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        quote = BookQuote("m2", 0.49, 0.51, 0.49, 0.51, STAMP, observed_at=STAMP)
+        result = tick(self.db, state, quote)
+        self.assertEqual(result["paper_actions"], [])
+
+    def test_state_change_can_close_or_flip_position(self):
+        opening = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        first_book = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        tick(self.db, opening, first_book)
+        later_stamp = "2026-08-27T00:10:00Z"
+        trailing = LiveState("m1", later_stamp, 1, 1, 4, 11, economy_a=-1, economy_b=1, observed_at=later_stamp)
+        later_book = BookQuote("m1", 0.12, 0.14, 0.86, 0.88, later_stamp, observed_at=later_stamp)
+        result = tick(self.db, trailing, later_book)
+        actions = [item["action"] for item in result["paper_actions"]]
+        self.assertIn("SELL", actions)
+        account = self.db.account_payload()
+        open_cost = sum(item["shares"] * item["avg_cost"] for item in account["positions"])
+        # Realized losses consume the same $10 match-risk budget.
+        self.assertLessEqual(open_cost - account["realized_pnl"], 10.0 + 1e-8)
+
+    def test_price_drop_does_not_average_beyond_risk_cap(self):
+        opening = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        first_book = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        tick(self.db, opening, first_book)
+        later_stamp = "2026-08-27T00:05:00Z"
+        stronger = LiveState("m1", later_stamp, 1, 1, 8, 5, economy_a=1, economy_b=-1, observed_at=later_stamp)
+        cheaper_book = BookQuote("m1", 0.28, 0.30, 0.70, 0.72, later_stamp, observed_at=later_stamp)
+        tick(self.db, stronger, cheaper_book)
+        account = self.db.account_payload()
+        open_cost = sum(item["shares"] * item["avg_cost"] for item in account["positions"])
+        self.assertLessEqual(open_cost, 10.0 + 1e-8)
+
+
+if __name__ == "__main__":
+    unittest.main()

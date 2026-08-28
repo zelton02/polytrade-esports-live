@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>POLYTRADE // ESPORTS LIVE</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="scan" aria-hidden="true"></div>
+
+<header class="masthead">
+  <div class="brand">
+    <div class="wordmark">POLYTRADE<span class="slash">//</span>ESPORTS<b class="caret"></b></div>
+    <div class="tagline">CS2 series probability terminal &middot; paper only</div>
+  </div>
+  <div class="beacon">
+    <div class="beacon-row"><span id="live-dot" class="dot"></span><span id="live-label">CONNECTING</span></div>
+    <div class="beacon-sub" id="cycle">&mdash;</div>
+  </div>
+</header>
+
+<section class="rail" aria-label="Summary">
+  <div class="cell"><span class="k">LIVE</span><b id="s-live">&mdash;</b></div>
+  <div class="cell"><span class="k">PENDING</span><b id="s-pending">&mdash;</b></div>
+  <div class="cell"><span class="k">TRACKED</span><b id="s-tracked">&mdash;</b></div>
+  <div class="cell"><span class="k">AI PRICED</span><b id="s-priced">&mdash;</b></div>
+  <div class="cell"><span class="k">RESOLVED</span><b id="s-resolved">&mdash;</b></div>
+  <div class="cell"><span class="k">EQUITY</span><b id="s-equity">&mdash;</b></div>
+  <div class="cell"><span class="k">RETURN</span><b id="s-return">&mdash;</b></div>
+</section>
+
+<main>
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>SCOREBOARD<span class="count" id="c-scored"></span></h2>
+    <div class="scorecard">
+      <div class="verdict" id="verdict">&mdash;</div>
+      <div class="scoregrid">
+        <div class="scorecol" id="col-ai">
+          <span class="k">AI PRIOR</span><b id="ai-brier">&mdash;</b>
+          <div class="sub">BRIER &middot; lower is better</div>
+          <div class="sub" id="ai-extra">&mdash;</div>
+        </div>
+        <div class="scorecol" id="col-mkt">
+          <span class="k">MARKET</span><b id="mkt-brier">&mdash;</b>
+          <div class="sub">same matches, same instant</div>
+          <div class="sub" id="mkt-extra">&mdash;</div>
+        </div>
+        <div class="scorecol">
+          <span class="k">COIN FLIP</span><b class="muted-val">0.250</b>
+          <div class="sub">always saying 50/50</div>
+          <div class="sub" id="coin-note">&mdash;</div>
+        </div>
+      </div>
+      <div class="caveat" id="caveat">&mdash;</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>LIVE<span class="count" id="c-live"></span></h2>
+    <div id="live-list" class="grid"></div>
+  </section>
+
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>AWAITING SETTLEMENT<span class="count" id="c-pending"></span></h2>
+    <div id="pending-list" class="grid"></div>
+  </section>
+
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>UPCOMING<span class="count" id="c-soon"></span></h2>
+    <div id="soon-list" class="grid"></div>
+  </section>
+
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>PAPER LEDGER</h2>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>TIME</th><th>MATCH</th><th>ACT</th><th>SIDE</th><th class="num">SHARES</th><th class="num">PRICE</th><th>REASON</th></tr></thead>
+        <tbody id="trades"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>Research instrument. Model output, not advice.</span>
+  <span>Edge measured against the executable ask.</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polytrade-esports-live"
+version = "0.2.1"
+description = "Low-dependency CS2 live probability research and paper trading"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+polytrade-esports = "polytrade_esports.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+polytrade_esports = ["web/*.html", "demo_series.jsonl"]

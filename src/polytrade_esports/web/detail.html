@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>MATCH // POLYTRADE ESPORTS</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="detail">
+<div class="scan" aria-hidden="true"></div>
+
+<header class="masthead">
+  <div class="brand">
+    <a class="back" href="/">&larr; ALL MATCHES</a>
+    <div class="wordmark" id="d-title">&mdash;</div>
+    <div class="tagline" id="d-comp">&mdash;</div>
+  </div>
+  <div class="beacon">
+    <div class="beacon-row"><span id="d-dot" class="dot"></span><span id="d-state">LOADING</span></div>
+    <div class="beacon-sub" id="d-sched">&mdash;</div>
+  </div>
+</header>
+
+<section class="rail" aria-label="Summary">
+  <div class="cell"><span class="k">MODEL</span><b id="d-model">&mdash;</b></div>
+  <div class="cell"><span class="k">MARKET</span><b id="d-market">&mdash;</b></div>
+  <div class="cell"><span class="k">BEST EDGE</span><b id="d-edge">&mdash;</b></div>
+  <div class="cell"><span class="k">MAPS</span><b id="d-maps">&mdash;</b></div>
+  <div class="cell"><span class="k">ROUNDS</span><b id="d-rounds">&mdash;</b></div>
+  <div class="cell"><span class="k">LIQUIDITY</span><b id="d-liq">&mdash;</b></div>
+</section>
+
+<main>
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>TRAJECTORY<span class="count" id="d-points"></span></h2>
+    <div class="chartbox">
+      <div id="chart" class="chart"></div>
+      <div class="legend">
+        <span><i class="swatch model"></i>MODEL</span>
+        <span><i class="swatch market"></i>MARKET</span>
+        <span><i class="swatch band"></i>EDGE</span>
+        <span class="legend-note" id="chart-note">&mdash;</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="block two-up">
+    <div>
+      <h2 class="head"><span class="bar"></span>AI VIEW</h2>
+      <div class="panel" id="d-ai">&mdash;</div>
+    </div>
+    <div>
+      <h2 class="head"><span class="bar"></span>ORDER BOOK</h2>
+      <div class="panel" id="d-book">&mdash;</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>PAPER POSITION</h2>
+    <div class="panel" id="d-paper">&mdash;</div>
+  </section>
+
+  <section class="block">
+    <h2 class="head"><span class="bar"></span>OBSERVATIONS<span class="count" id="d-obs-count"></span></h2>
+    <div class="scroller">
+      <table>
+        <thead><tr>
+          <th>TIME</th><th class="num">MODEL</th><th class="num">MARKET</th>
+          <th class="num">EDGE A</th><th class="num">EDGE B</th>
+          <th>MAPS</th><th>RDS</th><th>MAP</th><th>SOURCE</th>
+        </tr></thead>
+        <tbody id="d-obs"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>Research instrument. Model output, not advice.</span>
+  <span id="d-ids">&mdash;</span>
+</footer>
+
+<script src="/detail.js"></script>
+</body>
+</html>

@@ -1,0 +1,136 @@
+name: polytrade-esports-live
+
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polytrade-esports-live:0.2.1
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - ./data:/app/data
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PANDASCORE_TOKEN: "${PANDASCORE_TOKEN:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  # Priors run in their own container so coverage no longer depends on a host
+  # binary. A match is priced once, so a cycle that finds nothing new costs one
+  # query and no API call.
+  priors:
+    image: polytrade-esports-live:0.2.1
+    command:
+      - python
+      - -m
+      - polytrade_esports
+      - forecast-priors
+      - --db
+      - /app/data/esports_live.sqlite3
+      - --backend
+      - deepseek
+      - --loop-seconds
+      - "900"
+      - --limit
+      - "12"
+      - --daily-limit
+      - "200"
+      - --monthly-budget-usd
+      - "3.0"
+      - --max-cost-per-forecast
+      - "0.02"
+      # Skip markets too thin to hold a position; the prior would buy nothing.
+      - --min-liquidity
+      - "100"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ./data:/app/data
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.25
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
+  dashboard:
+    image: polytrade-esports-live:0.2.1
+    command:
+      - python
+      - -m
+      - polytrade_esports
+      - serve
+      - --db
+      - /app/data/esports_live.sqlite3
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8788"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      # SQLite WAL readers need the directory for transient lock files.
+      - ./data:/app/data
+    ports:
+      - 127.0.0.1:8788:8788
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      POLYTRADE_DASHBOARD_USERNAME: "${POLYTRADE_DASHBOARD_USERNAME:-}"
+      POLYTRADE_DASHBOARD_PASSWORD_SHA256: "${POLYTRADE_DASHBOARD_PASSWORD_SHA256:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.25
+    pids_limit: 64
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/healthz', timeout=5).read()"
+      interval: 1m
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

@@ -1,0 +1,117 @@
+{
+  "ended": false,
+  "eventMetadata": {
+    "context_description": "Esport Academy Copenhagen enters the BO3 Logitech G Play Connect Closed Qualifier matchup against Lavked with a recent 2-0 head-to-head win from mid-August playoffs and a stable five-man Danish roster featuring Fessor, N1XEN, anber, sSen, and AWPer bekker under coach wezx. The team has shown inconsi",
+    "league": "Logitech G Play Connect",
+    "pandascoreMatchId": 1648237,
+    "serie": "Closed Qualifier",
+    "tournament": "Group A"
+  },
+  "id": "924666",
+  "liquidity": 5211.5978,
+  "live": false,
+  "markets": [
+    {
+      "clobTokenIds": "[\"74545437113425015799202876689227165758630871424405930318414058998434232575222\", \"23190261626766433902606080343137273306661573529097054464305828361746473010849\"]",
+      "closed": false,
+      "conditionId": "0xd5502af3baa35012aa9c91b285b45267c18b5471c18a036183f445e80e6db88e",
+      "groupItemTitle": "Map 1 Winner",
+      "id": "3948480",
+      "outcomePrices": "[\"0.58\", \"0.42\"]",
+      "outcomes": "[\"Lavked\", \"Esport Academy Copenhagen\"]",
+      "question": "Counter-Strike: Lavked vs Esport Academy Copenhagen - Map 1 Winner",
+      "slug": "cs2-lavked-eac-2026-08-29-game1",
+      "sportsMarketType": "child_moneyline"
+    },
+    {
+      "clobTokenIds": "[\"16187890267942070325511327672050311106660997636760368346327206942482482546660\", \"90125887407940716131437999439554795651370675535690185679645483121483894709826\"]",
+      "closed": false,
+      "conditionId": "0xcecef9dc7421e43aa83ec071474d8d8fda6e39defbdb12061eec6a7148983ea7",
+      "groupItemTitle": "Map 2 Winner",
+      "id": "3948481",
+      "outcomePrices": "[\"0.385\", \"0.615\"]",
+      "outcomes": "[\"Lavked\", \"Esport Academy Copenhagen\"]",
+      "question": "Counter-Strike: Lavked vs Esport Academy Copenhagen - Map 2 Winner",
+      "slug": "cs2-lavked-eac-2026-08-29-game2",
+      "sportsMarketType": "child_moneyline"
+    },
+    {
+      "clobTokenIds": "[\"35615086053448647528864007863856792781261755504500364874203080030756569686708\", \"18025953602635038427170411462760020654299157297441429147613391212365008289033\"]",
+      "closed": false,
+      "conditionId": "0x3fa5b32a7c78fb3e983443f79b1e160a19db78852fd2b9ee668856f015d2ea25",
+      "groupItemTitle": "Match Winner",
+      "id": "3948482",
+      "outcomePrices": "[\"0.35\", \"0.65\"]",
+      "outcomes": "[\"Lavked\", \"Esport Academy Copenhagen\"]",
+      "question": "Counter-Strike: Lavked vs Esport Academy Copenhagen (BO3) - Logitech G Play Connect Closed Qualifier Group A",
+      "slug": "cs2-lavked-eac-2026-08-29",
+      "sportsMarketType": "moneyline"
+    },
+    {
+      "clobTokenIds": "[\"4032133961979677349510703080145160015879801982969638357158076885606708259879\", \"1988833883460608341078388276785348003958872906039524221795132677592028728483\"]",
+      "closed": false,
+      "conditionId": "0x59a7644121a08d4e1f62dd023fd67c757df96179bd50608ce5796a0f7cb311f2",
+      "groupItemTitle": "O/U 2.5 Games",
+      "id": "3948483",
+      "outcomePrices": "[\"0.465\", \"0.535\"]",
+      "outcomes": "[\"Over\", \"Under\"]",
+      "question": "Games Total: O/U 2.5",
+      "slug": "cs2-lavked-eac-2026-08-29-total-games-2pt5",
+      "sportsMarketType": "totals"
+    },
+    {
+      "clobTokenIds": "[\"17372382465520522881829351504696972843286245994630503911076767820998463658703\", \"29616267764580285410623532735721332671954329164077874337792896264328537515230\"]",
+      "closed": false,
+      "conditionId": "0x0551f1750edf117d9348c8b640b5d72e4b1dc9eaeda3bbae90ed2511606a4c5b",
+      "groupItemTitle": "Map Handicap: EAC (-1.5) vs Lavked (+1.5)",
+      "id": "3948484",
+      "outcomePrices": "[\"0.5\", \"0.5\"]",
+      "outcomes": "[\"Esport Academy Copenhagen\", \"Lavked\"]",
+      "question": "Map Handicap: EAC (-1.5) vs Lavked (+1.5)",
+      "slug": "cs2-lavked-eac-2026-08-29-map-handicap-home-1pt5",
+      "sportsMarketType": "map_handicap"
+    },
+    {
+      "clobTokenIds": "[\"95587703415982373352319658339640391212729383532922234320111264535733949171604\", \"27811500286931399975742832956270376091652280970797775317043706591682924214407\"]",
+      "closed": false,
+      "conditionId": "0xfa50020ff601fd59e971a25e0def6617a606dd9a677dfa63b028d0f8393f3729",
+      "groupItemTitle": "Map 1 Total Rounds: Over/Under 21.5",
+      "id": "3948485",
+      "outcomePrices": "[\"0.5\", \"0.5\"]",
+      "outcomes": "[\"Over\", \"Under\"]",
+      "question": "Map 1 Total Rounds: Over/Under 21.5",
+      "slug": "cs2-lavked-eac-2026-08-29-game1-round-total-21pt5",
+      "sportsMarketType": "round_over_under_game_1"
+    },
+    {
+      "clobTokenIds": "[\"50237404588555674702728281743384038719227335385700193282017113270456246920070\", \"72959357043815706162574385679087532219170681083353832324963585859199976915664\"]",
+      "closed": false,
+      "conditionId": "0x603bb741868c324958c879f8dbd492b184bc46de2dbd1ba25f99429fdd607f36",
+      "groupItemTitle": "Map 2 Total Rounds: Over/Under 21.5",
+      "id": "3948486",
+      "outcomePrices": "[\"0.5\", \"0.5\"]",
+      "outcomes": "[\"Over\", \"Under\"]",
+      "question": "Map 2 Total Rounds: Over/Under 21.5",
+      "slug": "cs2-lavked-eac-2026-08-29-game2-round-total-21pt5",
+      "sportsMarketType": "round_over_under_game_2"
+    },
+    {
+      "clobTokenIds": "[\"10724481809136464091719812604708619784795006425456326417322796058729276181944\", \"24480857325229899347601141825858009225952755157708695966765947706138934161219\"]",
+      "closed": false,
+      "conditionId": "0x8d9ce69a51c3b1bddbb76b68bcb49b50ae0f8317205eb9265440ca55cb03f749",
+      "groupItemTitle": "Map 3 Total Rounds: Over/Under 21.5",
+      "id": "3948487",
+      "outcomePrices": "[\"0.5\", \"0.5\"]",
+      "outcomes": "[\"Over\", \"Under\"]",
+      "question": "Map 3 Total Rounds: Over/Under 21.5",
+      "slug": "cs2-lavked-eac-2026-08-29-game3-round-total-21pt5",
+      "sportsMarketType": "round_over_under_game_3"
+    }
+  ],
+  "period": "0/3",
+  "resolutionSource": "https://www.twitch.tv/connect_en",
+  "score": "0-0|0-0|Bo3",
+  "slug": "cs2-lavked-eac-2026-08-29",
+  "startTime": "2026-08-29T08:00:00Z",
+  "title": "Counter-Strike: Lavked vs Esport Academy Copenhagen (BO3) - Logitech G Play Connect Closed Qualifier Group A"
+}

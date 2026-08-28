@@ -1,0 +1,22 @@
+[Unit]
+Description=Price upcoming CS2 matches with the LLM prior every two hours
+
+[Timer]
+OnCalendar=*-*-* 01:40:00 UTC
+OnCalendar=*-*-* 03:40:00 UTC
+OnCalendar=*-*-* 05:40:00 UTC
+OnCalendar=*-*-* 07:40:00 UTC
+OnCalendar=*-*-* 09:40:00 UTC
+OnCalendar=*-*-* 11:40:00 UTC
+OnCalendar=*-*-* 13:40:00 UTC
+OnCalendar=*-*-* 15:40:00 UTC
+OnCalendar=*-*-* 17:40:00 UTC
+OnCalendar=*-*-* 19:40:00 UTC
+OnCalendar=*-*-* 21:40:00 UTC
+OnCalendar=*-*-* 23:40:00 UTC
+RandomizedDelaySec=5m
+Persistent=true
+Unit=polytrade-esports-priors.service
+
+[Install]
+WantedBy=timers.target
