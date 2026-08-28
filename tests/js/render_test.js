@@ -27,7 +27,15 @@ function boot(options) {
   const clock = { now: 1000 };
   const context = {
     document,
-    window: {},
+    window: {
+      localStorage: (function () {
+        const store = options.stored || {};
+        return {
+          getItem: (k) => (k in store ? store[k] : null),
+          setItem: (k, v) => { store[k] = String(v); },
+        };
+      })(),
+    },
     console: { error() {} },
     setInterval() {},
     fetch: () => new Promise(() => {}),
@@ -87,6 +95,10 @@ function match(overrides) {
       best_side: "B",
       liquidity: 1234.5,
       prior_source: "llm:deepseek-v4-pro",
+      prior_backend: "deepseek",
+      prior_grounded_teams: 2,
+      prior_backend: "deepseek",
+      prior_grounded_teams: 2,
       prior_probability_llm: 0.22,
       prior_confidence: "medium",
       prior_reasoning: "Spirit hold the head-to-head.",
@@ -261,7 +273,7 @@ const tests = {
   },
 
   "seed model is drawn differently from a priced one"() {
-    const { context, document } = boot();
+    const { context, document } = boot({ stored: { "polytrade.aiPricedOnly": "0" } });
     context.render(payload([match({ prior_source: "seed" })]));
     const card = cardOf(document.getElementById("live-list").children[0]);
     assert.ok(byClass(card, "mark model").className.indexOf("seed") >= 0);
@@ -381,6 +393,170 @@ const tests = {
     context.render(data);
     assert.strictEqual(document.getElementById("live-label").textContent, "MAPS-ONLY FEED");
     assert.ok(document.getElementById("live-dot").className.indexOf("stale") >= 0);
+  },
+
+  "the card separates a grounded prior from an ungrounded one"() {
+    const { context, document } = boot({ stored: { "polytrade.aiPricedOnly": "0" } });
+    context.render(payload([match()]));
+    let badge = byClass(cardOf(document.getElementById("live-list").children[0]), "prior-badge");
+    assert.ok(/GROUNDED/.test(badge.textContent), badge.textContent);
+    assert.ok(badge.className.indexOf("grounded") >= 0);
+    assert.ok(
+      badge.textContent.indexOf("head-to-head") < 0,
+      "the reasoning belongs on the detail page, not the overview"
+    );
+
+    // A prior written without fetched facts is a different object and must
+    // not read the same on the board.
+    context.render(payload([match({ prior_grounded_teams: 0 })]));
+    badge = byClass(cardOf(document.getElementById("live-list").children[0]), "prior-badge");
+    assert.ok(/AI PRIOR/.test(badge.textContent), badge.textContent);
+    assert.ok(badge.className.indexOf("grounded") < 0, "ungrounded must not read as grounded");
+
+    context.render(payload([match({ prior_source: "seed", prior_grounded_teams: 0 })]));
+    badge = byClass(cardOf(document.getElementById("live-list").children[0]), "prior-badge");
+    assert.ok(/SEED 50%/.test(badge.textContent), "the seed must be named as an absence of a view");
+  },
+
+  "the scoreboard admits what it excluded"() {
+    const { context, document } = boot();
+    const data = payload([match()]);
+    data.scoring = {
+      ai: { n: 2, brier: 0.19, log_loss: 0.55, accuracy: 1.0 },
+      market: { n: 2, brier: 0.21, log_loss: 0.6, accuracy: 0.5 },
+      brier_edge: 0.02, reliable: false, resolved_total: 2,
+      missing_baseline: 0, ai_beats_coin_flip: true, excluded: 91,
+    };
+    context.render(data);
+    const caveat = document.getElementById("caveat").textContent;
+    assert.ok(/91 earlier priors are excluded/.test(caveat), caveat);
+    assert.ok(/summary/.test(caveat), "the reason for exclusion must be stated");
+  },
+
+  "an unticked match shows no reading rather than a reading of zero"() {
+    // The markers used to default to 0%, which pinned them to the left edge
+    // and read as "the model says 0%" on every upcoming match.
+    const { context, document } = boot({ stored: { "polytrade.aiPricedOnly": "0" } });
+    context.render(payload([match({
+      probability_a: null, market_midpoint_a: null, edge_a: null, edge_b: null,
+      prior_probability_llm: null, prior_source: "seed",
+    })]));
+    const card = cardOf(document.getElementById("live-list").children[0]);
+    assert.strictEqual(byClass(card, "mark model").style.display, "none");
+    assert.strictEqual(byClass(card, "mark market").style.display, "none");
+    assert.ok(byClass(card, "track").className.indexOf("idle") >= 0);
+    assert.strictEqual(byClass(card, "track-note").textContent, "AWAITING FIRST TICK");
+    assert.strictEqual(figureValue(card, "MODEL").textContent, "—");
+  },
+
+  "a priced match shows its prior before the first tick"() {
+    const { context, document } = boot();
+    context.render(payload([match({
+      probability_a: null, market_midpoint_a: null,
+      prior_probability_llm: 0.72, prior_source: "llm:deepseek-v4-pro",
+    })]));
+    const card = cardOf(document.getElementById("live-list").children[0]);
+    assert.strictEqual(figureValue(card, "MODEL").textContent, "72.0%");
+    assert.strictEqual(byClass(card, "mark model").style.display, "");
+    assert.strictEqual(byClass(card, "mark model").style.left, "72.00%");
+    // The market has no current book, so it stays absent rather than borrowing
+    // the price recorded when the prior was written.
+    assert.strictEqual(byClass(card, "mark market").style.display, "none");
+    assert.strictEqual(figureValue(card, "MARKET").textContent, "—");
+  },
+
+  "markers reappear once a forecast arrives"() {
+    const { context, document } = boot();
+    context.render(payload([match({ probability_a: null, market_midpoint_a: null,
+                                    prior_probability_llm: null })]));
+    const card = cardOf(document.getElementById("live-list").children[0]);
+    assert.strictEqual(byClass(card, "mark model").style.display, "none");
+    context.render(payload([match()]));
+    assert.strictEqual(byClass(card, "mark model").style.display, "");
+    assert.ok(byClass(card, "track").className.indexOf("idle") < 0);
+    assert.strictEqual(byClass(card, "track-note").textContent, "");
+  },
+
+  "matches with no AI prior are hidden by default"() {
+    const { context, document } = boot();
+    context.render(payload([
+      match({ match_id: "priced" }),
+      match({ match_id: "unpriced", prior_source: "seed", prior_grounded_teams: 0 }),
+    ]));
+    const list = document.getElementById("live-list");
+    assert.strictEqual(list.children.length, 1, "only the priced match should show");
+    assert.strictEqual(document.getElementById("c-live").textContent, "[1/2]");
+  },
+
+  "the board says how many it is hiding"() {
+    const { context, document } = boot();
+    context.render(payload([
+      match({ match_id: "priced" }),
+      match({ match_id: "unpriced", prior_source: "seed" }),
+    ]));
+    const note = document.getElementById("filter-note").textContent;
+    assert.ok(/1 matches hidden/.test(note), note);
+    assert.ok(/seed 50%/.test(note), "the reason must be stated: " + note);
+  },
+
+  "turning the filter off reveals the rest without waiting for a poll"() {
+    const { context, document } = boot();
+    context.render(payload([
+      match({ match_id: "priced" }),
+      match({ match_id: "unpriced", prior_source: "seed" }),
+    ]));
+    const list = document.getElementById("live-list");
+    assert.strictEqual(list.children.length, 1);
+
+    document.getElementById("filter-toggle").dispatch("click");
+    assert.strictEqual(list.children.length, 2, "both matches should show");
+    assert.strictEqual(document.getElementById("filter-label").textContent, "SHOWING ALL");
+    assert.strictEqual(
+      document.getElementById("filter-toggle").getAttribute("aria-pressed"), "false"
+    );
+  },
+
+  "a remembered choice survives a reload"() {
+    const { context, document } = boot({ stored: { "polytrade.aiPricedOnly": "0" } });
+    context.render(payload([
+      match({ match_id: "priced" }),
+      match({ match_id: "unpriced", prior_source: "seed" }),
+    ]));
+    assert.strictEqual(document.getElementById("live-list").children.length, 2);
+    assert.strictEqual(document.getElementById("filter-label").textContent, "SHOWING ALL");
+  },
+
+  "an empty filtered section explains why it is empty"() {
+    const { context, document } = boot();
+    context.render(payload([match({ match_id: "unpriced", prior_source: "seed" })]));
+    const empty = document.getElementById("live-list").children[0];
+    assert.strictEqual(empty.className, "empty");
+    assert.ok(/Turn the filter off/.test(empty.textContent), empty.textContent);
+  },
+
+  "a filtered-out settlement backlog is still reported"() {
+    // Saying "none are awaiting settlement" while two dozen are stuck would
+    // hide a stalled settlement pipeline behind an analysis filter.
+    const { context, document } = boot();
+    context.render(payload([
+      match({ match_id: "done-1", live: 0, ended: 1, status: "open", prior_source: "seed" }),
+      match({ match_id: "done-2", live: 0, ended: 1, status: "open", prior_source: "seed" }),
+    ]));
+    const empty = document.getElementById("pending-list").children[0];
+    assert.strictEqual(empty.className, "empty");
+    assert.ok(/2 finished matches are waiting/.test(empty.textContent), empty.textContent);
+    assert.ok(
+      !/No finished matches are awaiting/.test(empty.textContent),
+      "the placeholder must not deny a backlog that exists"
+    );
+    assert.strictEqual(document.getElementById("c-pending").textContent, "[0/2]");
+  },
+
+  "a genuinely empty settlement queue still says so"() {
+    const { context, document } = boot();
+    context.render(payload([match()]));
+    const empty = document.getElementById("pending-list").children[0];
+    assert.ok(/No finished matches are awaiting/.test(empty.textContent), empty.textContent);
   },
 
   "empty list shows a placeholder and recovers"() {

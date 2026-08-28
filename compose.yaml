@@ -6,6 +6,26 @@ services:
       context: .
       dockerfile: Dockerfile
     image: polytrade-esports-live:0.2.2
+    command:
+      - python
+      - -m
+      - polytrade_esports
+      - collect
+      - --db
+      - /app/data/esports_live.sqlite3
+      - --cycles
+      - "0"
+      - --interval-seconds
+      - "60"
+      - --tick-window-hours
+      - "3"
+      # A fresh ledger for the grounded cohort. The previous account keeps its
+      # history: 95% of its trades were driven by priors later found to be
+      # paraphrases of the market, so mixing the two equity curves would leave
+      # neither readable. Positions opened under the old account still settle
+      # there, so that record stays complete.
+      - --account
+      - "grounded-paper"
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -47,8 +67,11 @@ services:
       - deepseek
       - --loop-seconds
       - "900"
+      # Liquipedia allows 60 requests an hour and one rendered page every 30
+      # seconds; a cold match costs roughly eight requests. Small batches stay
+      # inside that, and the team cache makes later cycles much cheaper.
       - --limit
-      - "12"
+      - "3"
       - --daily-limit
       - "200"
       - --monthly-budget-usd
@@ -56,8 +79,10 @@ services:
       - --max-cost-per-forecast
       - "0.02"
       # Skip markets too thin to hold a position; the prior would buy nothing.
+      # Below this a market cannot absorb a position, so a prior on it buys
+      # nothing but cost and a polluted cohort.
       - --min-liquidity
-      - "100"
+      - "20000"
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -92,6 +117,8 @@ services:
       - serve
       - --db
       - /app/data/esports_live.sqlite3
+      - --account
+      - "grounded-paper"
       - --host
       - 0.0.0.0
       - --port

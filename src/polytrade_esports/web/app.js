@@ -25,6 +25,37 @@ var UPCOMING_LIMIT = 48;
 var PENDING_LIMIT = 12;
 var COUNT_MS = 620;
 
+/* Board filter.
+
+   Most of the slate has no AI prior, and a card whose model reads "seed 50%"
+   is an absence of a view rather than a view worth reading. Hiding those by
+   default is what makes the board legible; the hidden count stays on screen so
+   the filter cannot quietly shrink the picture. */
+var FILTER_KEY = "polytrade.aiPricedOnly";
+var aiPricedOnly = true;
+var lastPayload = null;
+
+function hasPrior(match) {
+  return !!(match.prior_source && match.prior_source !== "seed");
+}
+
+function loadFilter() {
+  try {
+    var stored = window.localStorage.getItem(FILTER_KEY);
+    if (stored !== null) aiPricedOnly = stored === "1";
+  } catch (error) {
+    // Private browsing and similar; the default stands.
+  }
+}
+
+function saveFilter() {
+  try {
+    window.localStorage.setItem(FILTER_KEY, aiPricedOnly ? "1" : "0");
+  } catch (error) {
+    // Not being able to remember the choice is not worth failing over.
+  }
+}
+
 var registry = {
   live: Object.create(null),
   pending: Object.create(null),
@@ -196,10 +227,19 @@ function setClass(node, value) {
   if (node.className !== value) node.className = value;
 }
 
+/* Position a marker, or hide it when there is nothing to position.
+
+   Defaulting an absent value to zero pinned the marker to the left edge, which
+   reads as "the model says 0%" on every match that has not been ticked yet.
+   Absence and zero are different claims and must not render the same. */
 function place(node, ratio) {
-  var value = ratio === null || ratio === undefined || isNaN(ratio) ? 0 : Number(ratio);
-  var next = (Math.max(0, Math.min(1, value)) * 100).toFixed(2) + "%";
+  var known = ratio !== null && ratio !== undefined && !isNaN(ratio);
+  var hidden = known ? "" : "none";
+  if (node.style.display !== hidden) node.style.display = hidden;
+  if (!known) return false;
+  var next = (Math.max(0, Math.min(1, Number(ratio))) * 100).toFixed(2) + "%";
   if (node.style.left !== next) node.style.left = next;
+  return true;
 }
 
 /* Card ------------------------------------------------------------------- */
@@ -253,6 +293,9 @@ function buildCard(matchId) {
   card.appendChild(subline);
 
   var track = el("div", "track");
+  refs.track = track;
+  refs.trackNote = el("div", "track-note");
+  track.appendChild(refs.trackNote);
   refs.band = el("div", "band");
   refs.market = el("div", "mark market");
   refs.model = el("div", "mark model");
@@ -302,7 +345,13 @@ function updateCard(entry, match) {
   setText(refs.mapName, String(match.current_map || "—").toUpperCase());
 
   var priced = match.prior_source && match.prior_source !== "seed";
+  // Before the first tick there is no forecast, but a priced match still has
+  // a view: at 0-0 with no round feed the engine returns the prior unchanged,
+  // so the prior is the model's current number rather than a stand-in for it.
   var model = match.probability_a;
+  if (model === null || model === undefined) {
+    model = match.prior_probability_llm;
+  }
   var market = match.market_midpoint_a;
 
   setClass(refs.model, "mark model" + (priced ? "" : " seed"));
@@ -311,7 +360,10 @@ function updateCard(entry, match) {
 
   // The band spans model to market: its width is the disagreement, and its
   // colour says which way the model leans.
-  if (model !== null && model !== undefined && market !== null && market !== undefined) {
+  var haveBoth =
+    model !== null && model !== undefined && !isNaN(model) &&
+    market !== null && market !== undefined && !isNaN(market);
+  if (haveBoth) {
     var lo = Math.min(model, market);
     var hi = Math.max(model, market);
     refs.band.style.left = (lo * 100).toFixed(2) + "%";
@@ -320,6 +372,9 @@ function updateCard(entry, match) {
   } else {
     refs.band.style.width = "0%";
   }
+  // An empty track should look inert rather than look like a reading of zero.
+  setClass(refs.track, "track" + (model === null || model === undefined ? " idle" : ""));
+  setText(refs.trackNote, model === null || model === undefined ? "AWAITING FIRST TICK" : "");
 
   var bestEdge = null;
   if (match.edge_a !== null && match.edge_a !== undefined) {
@@ -332,13 +387,22 @@ function updateCard(entry, match) {
   changed = setNumber(refs.edgeValue, bestEdge, signedPct) || changed;
   setClass(refs.edgeValue, edgeTone(bestEdge));
 
-  var priced2 = match.prior_source && match.prior_source !== "seed";
-  setClass(refs.badge, "prior-badge" + (priced2 ? " priced" : ""));
+  // Grounding is the signal that matters now: a prior written with fetched
+  // team facts is a different thing from one written without, and the board
+  // should not let them look alike.
+  var hasPrior = match.prior_source && match.prior_source !== "seed";
+  var grounded = (match.prior_grounded_teams || 0) > 0;
+  setClass(
+    refs.badge,
+    "prior-badge" + (grounded ? " grounded" : hasPrior ? " priced" : "")
+  );
   setText(
     refs.badge,
-    priced2
-      ? "AI PRIOR · " + String(match.prior_confidence || "").toUpperCase() + " · DETAIL →"
-      : "NO AI PRIOR · DETAIL →"
+    hasPrior
+      ? (grounded ? "GROUNDED" : "AI PRIOR") +
+        " · " + String(match.prior_confidence || "").toUpperCase() +
+        " · " + String(match.prior_backend || "").toUpperCase() + " →"
+      : "NO AI PRIOR · SEED 50% →"
   );
 
   return changed;
@@ -492,6 +556,12 @@ function renderScoreboard(report) {
   if (report.missing_baseline) {
     parts.push(report.missing_baseline + " skipped: no market price recorded at prior time, and inventing one would fake the comparison.");
   }
+  if (report.excluded) {
+    parts.push(
+      report.excluded +
+        " earlier priors are excluded: written with no web access and no fetched facts, they tracked the market's own summary rather than forming a view."
+    );
+  }
   if (!parts.length) {
     parts.push("Scores appear once an AI-priced match finishes and Polymarket settles it, typically 6-24h after the match.");
   }
@@ -508,6 +578,7 @@ function setBeacon(state, label) {
 }
 
 function render(data) {
+  lastPayload = data;
   var counts = data.counts || {};
   var account = data.account || {};
   var matches = data.matches || [];
@@ -515,7 +586,7 @@ function render(data) {
   setNumber(document.getElementById("s-live"), counts.live, whole);
   setNumber(document.getElementById("s-pending"), counts.pending, whole);
   setNumber(document.getElementById("s-tracked"), counts.matches, whole);
-  setNumber(document.getElementById("s-priced"), counts.priced, whole);
+  setNumber(document.getElementById("s-priced"), counts.grounded_priors, whole);
   setNumber(document.getElementById("s-resolved"), counts.resolved, whole);
   setNumber(document.getElementById("s-equity"), account.equity, money);
 
@@ -554,21 +625,67 @@ function render(data) {
     .filter(function (m) { return !m.live && !m.ended && m.status === "open"; })
     .slice(0, UPCOMING_LIMIT);
 
-  setText(document.getElementById("c-live"), "[" + live.length + "]");
+  var totals = { live: live.length, pending: pending.length, soon: soon.length };
+  if (aiPricedOnly) {
+    live = live.filter(hasPrior);
+    pending = pending.filter(hasPrior);
+    soon = soon.filter(hasPrior);
+  }
+  var hidden =
+    (totals.live - live.length) +
+    (totals.soon - soon.length) +
+    (totals.pending - pending.length);
+  setText(
+    document.getElementById("filter-note"),
+    aiPricedOnly
+      ? (hidden ? hidden + " matches hidden — no AI prior, model held at seed 50%"
+                : "nothing hidden — every tracked match has a prior")
+      : "showing every tracked match, priced or not"
+  );
+
+  setText(
+    document.getElementById("c-live"),
+    "[" + live.length + (live.length < totals.live ? "/" + totals.live : "") + "]"
+  );
   setText(
     document.getElementById("c-pending"),
     "[" + pending.length + (pending.length < pendingAll.length ? "/" + pendingAll.length : "") + "]"
   );
-  setText(document.getElementById("c-soon"), "[" + soon.length + "]");
+  setText(
+    document.getElementById("c-soon"),
+    "[" + soon.length + (soon.length < totals.soon ? "/" + totals.soon : "") + "]"
+  );
 
-  syncList(document.getElementById("live-list"), registry.live, live, "No CS2 match is live right now.");
+  syncList(
+    document.getElementById("live-list"),
+    registry.live,
+    live,
+    aiPricedOnly && totals.live
+      ? "No live match has an AI prior. Turn the filter off to see the rest."
+      : "No CS2 match is live right now."
+  );
+  // The filter may empty this section, but the backlog is operational state,
+  // not an opinion. Saying "none are awaiting settlement" while two dozen are
+  // stuck would hide a stalled settlement pipeline behind an analysis filter,
+  // so the count is stated in the placeholder either way.
+  var pendingHidden = pendingAll.length - pending.length;
   syncList(
     document.getElementById("pending-list"),
     registry.pending,
     pending,
-    "No finished matches are awaiting settlement."
+    pendingHidden
+      ? pendingAll.length +
+        " finished matches are waiting for Polymarket to settle; none has an AI prior. Turn the filter off to see them."
+      : "No finished matches are awaiting settlement."
   );
-  syncList(document.getElementById("soon-list"), registry.soon, soon, "No upcoming matches tracked.");
+  syncList(
+    document.getElementById("soon-list"),
+    registry.soon,
+    soon,
+    aiPricedOnly && totals.soon
+      ? "No upcoming match has an AI prior yet. Turn the filter off to see the rest."
+      : "No upcoming matches tracked."
+  );
   renderScoreboard(data.scoring);
   syncTrades(document.getElementById("trades"), account.trades || []);
 }
@@ -585,6 +702,26 @@ function refresh() {
       if (window.console) console.error(error);
     });
 }
+
+function applyFilterButton() {
+  var button = document.getElementById("filter-toggle");
+  button.setAttribute("aria-pressed", aiPricedOnly ? "true" : "false");
+  setText(
+    document.getElementById("filter-label"),
+    aiPricedOnly ? "AI-PRICED ONLY" : "SHOWING ALL"
+  );
+}
+
+loadFilter();
+applyFilterButton();
+document.getElementById("filter-toggle").addEventListener("click", function () {
+  aiPricedOnly = !aiPricedOnly;
+  saveFilter();
+  applyFilterButton();
+  // Re-render from the payload already in hand rather than making the reader
+  // wait out the poll interval.
+  if (lastPayload) render(lastPayload);
+});
 
 refresh();
 setInterval(refresh, REFRESH_MS);

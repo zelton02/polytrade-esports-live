@@ -116,6 +116,38 @@ body {
 /* Sections -------------------------------------------------------------- */
 
 main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
+
+/* Board filter. The default hides matches with no AI prior: most of the slate
+   has none, and a card whose model reads "seed 50%" carries no view to look
+   at. The count of what is hidden stays visible so the filter never silently
+   shrinks the picture. */
+.controls {
+  position: relative; z-index: 2;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px var(--gut); border-bottom: 1px solid var(--line);
+}
+
+.toggle {
+  display: inline-flex; align-items: center; gap: 9px;
+  padding: 7px 12px; cursor: pointer;
+  background: var(--panel); color: var(--dim);
+  border: 1px solid var(--line);
+  font: 600 10px/1 var(--mono); letter-spacing: 0.18em;
+  transition: color 0.25s var(--ease), border-color 0.25s var(--ease);
+}
+.toggle:hover { color: var(--ink); border-color: var(--line-hot); }
+.toggle[aria-pressed="true"] { color: var(--phos); border-color: var(--line-hot); }
+
+.dot-sq {
+  width: 8px; height: 8px; background: transparent;
+  border: 1px solid currentColor;
+  transition: background 0.25s var(--ease);
+}
+.toggle[aria-pressed="true"] .dot-sq {
+  background: var(--phos); box-shadow: 0 0 8px rgba(63, 240, 168, 0.6);
+}
+
+.controls-note { color: var(--faint); font-size: 10px; letter-spacing: 0.1em; }
 .block { margin-top: 32px; }
 
 .head {
@@ -144,6 +176,7 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 /* Match card ------------------------------------------------------------ */
 
 .match {
+  min-width: 0;
   border: 1px solid var(--line);
   background: linear-gradient(180deg, var(--panel-2), var(--panel));
   padding: 13px 14px 11px;
@@ -182,7 +215,12 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
   color: var(--faint); font-size: 9.5px; letter-spacing: 0.13em;
   white-space: nowrap; overflow: hidden;
 }
-.meta .comp { overflow: hidden; text-overflow: ellipsis; }
+/* min-width:0 is required on every flex and grid child that holds text:
+   the default of auto refuses to shrink below the content width, which is
+   what pushed long team and tournament names past the card edge on a phone. */
+.meta > * { min-width: 0; }
+.meta .comp { overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; }
+.meta > div:last-child { flex: 0 0 auto; }
 
 .tag {
   color: var(--carbon); background: var(--phos); padding: 1px 6px;
@@ -194,9 +232,10 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 /* Teams and score */
 
 .board {
-  display: grid; grid-template-columns: 1fr auto 1fr;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: baseline; gap: 8px; margin: 10px 0 4px;
 }
+.board > * { min-width: 0; }
 .team {
   font: 600 14px/1.25 var(--mono);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -210,8 +249,9 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 .subline {
   display: flex; justify-content: space-between; gap: 8px;
   color: var(--faint); font-size: 9.5px; letter-spacing: 0.12em;
-  margin-bottom: 10px;
+  margin-bottom: 10px; white-space: nowrap; overflow: hidden;
 }
+.subline > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .subline .rounds { color: var(--phos); }
 .subline .rounds.idle { color: var(--faint); }
 
@@ -229,6 +269,17 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
   transition: left 0.65s var(--ease), width 0.65s var(--ease), background 0.4s var(--ease);
 }
 .band.negative { background: rgba(255, 107, 94, 0.16); }
+
+/* No forecast yet: the track carries no reading, and must not look like one. */
+.track.idle {
+  background: repeating-linear-gradient(45deg, #071310 0 6px, #0a1714 6px 12px);
+}
+.track-note {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--faint); font-size: 8.5px; letter-spacing: 0.18em;
+  pointer-events: none;
+}
 
 .mark {
   position: absolute; top: -1px; bottom: -1px; width: 2px;
@@ -253,8 +304,11 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px; background: var(--line); border: 1px solid var(--line);
 }
-.figures div { background: var(--panel); padding: 6px 8px; }
-.figures span { display: block; color: var(--faint); font-size: 8.5px; letter-spacing: 0.16em; }
+.figures div { background: var(--panel); padding: 6px 8px; min-width: 0; }
+.figures span {
+  display: block; color: var(--faint); font-size: 8.5px; letter-spacing: 0.16em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .figures b {
   display: block; margin-top: 3px;
   font: 600 13px/1 var(--mono); font-variant-numeric: tabular-nums;
@@ -318,6 +372,32 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 }
 .caveat.warn { color: var(--amber); }
 
+/* Collapsible section. Used for the raw observation log: it is the audit
+   trail behind the trajectory chart, so it should stay reachable, but a
+   hundred rows of ticks is not what the page is for. */
+
+.fold > summary {
+  display: flex; align-items: center; gap: 11px; cursor: pointer;
+  margin: 0 0 14px; list-style: none;
+  font: 600 11.5px/1 var(--mono); letter-spacing: 0.26em; color: var(--ink);
+  transition: color 0.25s var(--ease);
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary:hover { color: var(--phos); }
+.fold > summary .bar {
+  width: 18px; height: 2px; background: var(--phos);
+  box-shadow: 0 0 9px rgba(63, 240, 168, 0.6);
+}
+.fold > summary::after {
+  content: "SHOW"; margin-left: auto;
+  color: var(--faint); font-size: 9px; letter-spacing: 0.18em;
+}
+.fold[open] > summary::after { content: "HIDE"; }
+.fold-note {
+  color: var(--faint); font-size: 9px; letter-spacing: 0.12em;
+  text-transform: none;
+}
+
 /* Ledger ---------------------------------------------------------------- */
 
 .scroller { overflow-x: auto; border: 1px solid var(--line); }
@@ -325,7 +405,11 @@ table { width: 100%; border-collapse: collapse; min-width: 700px; }
 th, td { padding: 8px 11px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { color: var(--faint); font-size: 9px; font-weight: 600; letter-spacing: 0.18em; background: var(--panel-2); }
 td { font-size: 11px; color: var(--dim); }
-td.num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
+/* Numeric values are right-aligned, so their headers must be too; a
+   left-aligned header over a right-aligned column reads as a full column of
+   offset, which made SHARES look empty and its values look like prices. */
+th.num, td.num { text-align: right; }
+td.num { font-variant-numeric: tabular-nums; color: var(--ink); }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: rgba(63,240,168,0.03); }
 .buy { color: var(--phos); } .sell { color: var(--amber); }
@@ -347,7 +431,7 @@ tbody tr:hover td { background: rgba(63,240,168,0.03); }
   .cell:nth-child(n+4) { border-top: 1px solid var(--line); }
   .scoregrid { grid-template-columns: 1fr; }
 }
-@media (max-width: 560px) {
+@media (max-width: 620px) {
   .rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cell:nth-child(2n+1) { border-left: 0; }
   .cell:nth-child(n+3) { border-top: 1px solid var(--line); }
@@ -355,6 +439,27 @@ tbody tr:hover td { background: rgba(63,240,168,0.03); }
   .masthead { align-items: flex-start; }
   .beacon { text-align: left; }
   .beacon-row { justify-content: flex-start; }
+
+  /* One row per team, score right-aligned. Three columns on a narrow screen
+     leaves each name a sliver, and "Inner Circle Academy" truncates to
+     nothing useful. */
+  .board {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 2px;
+    align-items: center;
+  }
+  .team { grid-column: 1; text-align: left; font-size: 15px; }
+  .team.b { grid-column: 1; grid-row: 2; text-align: left; }
+  .maps {
+    grid-column: 2; grid-row: 1 / span 2;
+    align-self: center; font-size: 20px; padding-left: 12px;
+  }
+
+  .figures { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .figures span { font-size: 8px; letter-spacing: 0.1em; }
+  .figures b { font-size: 12px; }
+  .meta { font-size: 9px; letter-spacing: 0.08em; }
+  .prior-badge { font-size: 8.5px; letter-spacing: 0.1em; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -442,9 +547,16 @@ tbody tr:hover td { background: rgba(63,240,168,0.03); }
 
 .hint { color: var(--faint); font-size: 11px; letter-spacing: 0.05em; line-height: 1.6; }
 
+.facts {
+  margin: 12px 0 0; padding: 12px;
+  background: #071310; border: 1px solid var(--line);
+  color: var(--ink); font: 11px/1.6 var(--mono);
+  white-space: pre-wrap; overflow-x: auto;
+}
+
 /* Cards become links on the overview */
 
-.match-link { text-decoration: none; color: inherit; display: block; }
+.match-link { text-decoration: none; color: inherit; display: block; min-width: 0; }
 .match-link:hover .match { border-color: var(--line-hot); }
 .match-link:hover .team { color: var(--phos); }
 
@@ -455,6 +567,10 @@ tbody tr:hover td { background: rgba(63,240,168,0.03); }
 .prior-badge {
   margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line);
   color: var(--faint); font-size: 9px; letter-spacing: 0.15em;
-  display: flex; justify-content: space-between;
+  display: flex; justify-content: space-between; gap: 8px;
+  white-space: nowrap; overflow: hidden;
 }
-.prior-badge.priced { color: var(--phos); }
+.prior-badge.priced { color: var(--amber); }
+/* A prior written from fetched team facts, as distinct from one written
+   without. They are not the same object and must not read the same. */
+.prior-badge.grounded { color: var(--phos); }

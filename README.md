@@ -137,6 +137,57 @@ separates a considered disagreement from the model simply lagging the book.
 Map-score changes are marked on it, since those are the moments the model was
 supposed to move.
 
+## The stale-model guard
+
+The engine only moves when the state feed moves. Between state changes it is a
+constant, so any edge that appears in that window is entirely the market
+moving — which means the market has learned something the feed has not shown
+us, and the apparent edge is our blindness rather than their error.
+
+The cost of not having this guard, from the recorded history of one match:
+
+```
+13:30 - 18:18   model 0.210, score 0-0, unchanged for five hours
+                market 0.205 -> 0.185 -> 0.425 -> 0.085
+18:18:22        market at 0.085 reads as a +12% edge -> BUY at 0.09
+18:19:23        map one ends 0-1, the model finally updates to 0.087
+18:35:45        edge gone -> SELL at 0.09
+```
+
+The market's collapse to 0.085 *was* map one ending. With no round feed the
+model could not see it, so it bought into news it was blind to and sold flat a
+minute later. On a real book that round trip costs the spread twice.
+
+Entry is therefore suppressed when the market has drifted more than
+`max_market_drift` since the last change in the state's *content*. Exits are
+deliberately exempt: being blind is a reason to stop opening positions, never a
+reason to keep one you would otherwise close.
+
+The anchor has to follow the state's content, not its row id. Every tick writes
+a new state row because `source_at` advances, so keying the anchor on
+`state_id` made the drift permanently zero and the guard silently inert — it
+was written that way first, and only the tests caught it.
+
+This guard is a mitigation for missing round data, not a substitute for it.
+With a live round feed the model would move when the market moves, and the
+question would not arise.
+
+## Known follow-ups
+
+- The one-off data repairs in `storage.py` (`_invalidate_ungrounded_priors`,
+  `_backfill_grounding`, `_backfill_web_grounding`, `_label_legacy_backends`)
+  run on every `initialize()`, which every entry point calls. Each is
+  idempotent and cheap, but the right shape is an applied-repairs ledger. That
+  changes migration semantics — a fresh database would mark them done
+  immediately — so it belongs in its own change with its own tests.
+- `web/app.js` and `web/detail.js` duplicate their formatting and DOM helpers.
+  The strict CSP forbids inline script and there is no bundler, so a shared
+  `util.js` served from the same origin is the fix when the duplication starts
+  to drift.
+- The Liquipedia throttle is a module-level singleton, so the hourly budget is
+  per process. That is correct while the collector, priors and dashboard run as
+  separate containers, and wrong the moment they share one.
+
 ## Resolution and scoring
 
 A forecast that is never settled is not evidence. Every cycle the collector
@@ -201,6 +252,54 @@ Matches more than 12 hours past their start are also not newly tracked, since
 Polymarket leaves finished esports events `closed: false` for weeks while UMA
 settles, which otherwise drags months of dead fixtures into the database.
 
+## Where the prior gets its facts
+
+The model is not asked to recall or search for team information. It is told,
+from data this system fetched and can cite.
+
+That decision came from a controlled test rather than a preference. The first
+generation of API-backed priors ran with no web access against a training
+cutoff 26 months older than the matches, so the only current information in the
+prompt was the market's own machine-written summary. Removing that summary moved
+the estimate from 0.27 to 0.46; reversing it moved the estimate to 0.70. The
+output was a paraphrase of the market, not a forecast of it. Those 91 priors are
+kept in the database and marked `methodology = 'ungrounded...'`, excluded from
+scoring, and their matches were reset to the seed so they could be priced again
+properly.
+
+`liquipedia.py` fetches, per team:
+
+- the active roster with join dates, which is what makes a stand-in or a
+  recent signing visible,
+- recent results with dates, tiers, opponents and scores,
+- aggregate win rates at match, map and round level.
+
+Only the free MediaWiki API is used; `action=parse` renders the results table,
+so no paid tier is required. The published limits are enforced in code, not by
+convention, because violating them earns an automated IP ban: one request per
+two seconds, one rendered page per thirty seconds, sixty requests per hour, and
+a User-Agent that names the project and carries contact details.
+
+Two guards exist because both failures were observed in production:
+
+**Results after the match start are dropped.** Liquipedia publishes a fixture's
+result as soon as it is played, so an unfiltered fetch put the result of the
+match under forecast inside that match's own evidence. The model noticed and
+discounted it, which is exactly the sort of thing that must not be left to the
+model.
+
+**A page is refused unless its title plausibly names the team.** Full-text
+search returned an ESEA season bracket for "Turma do Pagode" and `Imperial
+Female` for "Imperial" — a real team with a real roster, and the wrong one. A
+near-miss is a page of facts about somebody else, presented as verified, so
+resolution is strict and a team with no usable page simply gets none.
+
+**No facts, no forecast.** When neither team can be grounded the match is
+skipped rather than priced. That is the failure the first cohort died of: a
+prior with nothing to reason from still looks like a view, still unlocks the
+paper engine, and is really just a paraphrase of whatever text was in the
+prompt.
+
 ## Two prior backends
 
 `forecast-priors --backend deepseek` (default) calls the DeepSeek chat API
@@ -225,9 +324,12 @@ claiming it looked anything up, and told to leave `supporting_evidence` empty
 rather than inventing a URL. Telling a model it may research when it cannot is
 how you get a confident number behind a fabricated citation.
 
-Every prior records the model that produced it, so the two backends can be
-scored as separate cohorts once enough matches resolve. Which one is actually
-better is a question for the scoreboard, not for this table.
+Every prior records the backend that produced it in its own column, because
+`provider` reads "deepseek" either way and cannot separate the cohorts. With
+verified facts in the prompt the case for the web-researching backend narrows:
+the roster, form and head-to-head it used to go looking for are exactly what
+Liquipedia now supplies, and supplies verifiably. Which one is actually better
+is a question for the scoreboard, not for this table.
 
 **Caveat worth keeping in view:** that Polymarket blurb is written by
 Polymarket's own model and may reflect what the book has already priced. A prior
@@ -259,8 +361,15 @@ prior timer and the Cloudflare tunnel unit.
 
 ```bash
 chown -R 10002:10002 data      # the container runs as uid 10002
-docker compose build && docker compose up -d
+DASH_AUTH=user:password deploy/deploy.sh
 ```
+
+Use the script rather than `docker compose up -d --build`. On a host without the
+buildx plugin `docker compose build` **exits 0 and does nothing**, so the deploy
+reports success while the containers keep serving the previous image. The script
+builds the tag with `docker build`, recreates, and then compares the sha of the
+CSS the server actually returns against the file on disk, because a correct
+image proves nothing while a stale container still holds the port.
 
 ## Add a real paper match
 

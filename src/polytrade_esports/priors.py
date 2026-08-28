@@ -10,6 +10,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .liquipedia import LiquipediaClient, LiquipediaError
 from .llm import (
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
@@ -17,10 +18,59 @@ from .llm import (
     add_usage,
     build_prior_prompt,
     forecast_prior,
+    format_team_facts,
 )
 from .polymarket import PolymarketBookClient
 from .storage import Database
-from .timeutil import isoformat, utc_now
+from .timeutil import isoformat, parse_timestamp, utc_now
+
+
+def gather_facts(
+    database: Database,
+    row: Dict[str, Any],
+    client: Optional[LiquipediaClient],
+    max_age_hours: float = 12.0,
+) -> Tuple[str, int]:
+    """Fetch and cache Liquipedia facts for both teams, as a prompt block.
+
+    Results at or after the match start are excluded. Liquipedia publishes a
+    fixture's result as soon as it is played, so an unfiltered fetch can put
+    the answer inside the evidence for the question -- seen in testing, where
+    the forecast match appeared in its own evidence block.
+
+    A missing page is not an error worth failing the forecast over: lower-tier
+    rosters often have no wiki entry, and the prompt states plainly when data
+    could not be retrieved rather than leaving the model to fill the gap.
+    """
+    cutoff = None
+    scheduled = row.get("scheduled_at")
+    if scheduled:
+        try:
+            cutoff = parse_timestamp(scheduled).timestamp()
+        except ValueError:
+            cutoff = None
+    if cutoff is None:
+        cutoff = utc_now().timestamp()
+
+    blocks = []
+    grounded = 0
+    for team in (row["team_a"], row["team_b"]):
+        facts = database.cached_team_facts(team, max_age_hours=max_age_hours)
+        if facts is None and client is not None:
+            try:
+                facts = client.team_facts(team, before_timestamp=cutoff)
+            except LiquipediaError as error:
+                # Budget exhaustion is transient; do not poison the cache with
+                # it, or the team stays factless for the whole cache window.
+                facts = {"page": None, "error": str(error)}
+                if "budget" not in str(error):
+                    database.store_team_facts(team, facts)
+            else:
+                database.store_team_facts(team, facts)
+        if facts and not facts.get("error") and (facts.get("roster") or facts.get("recent")):
+            grounded += 1
+        blocks.append(format_team_facts(team, facts))
+    return "\n\n".join(blocks), grounded
 
 
 def _record_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -50,6 +100,9 @@ def run_priors(
     dry_run: bool = False,
     books: Optional[PolymarketBookClient] = None,
     backend_name: str = "",
+    liquipedia: Optional[LiquipediaClient] = None,
+    use_liquipedia: bool = True,
+    require_facts: bool = True,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if limit <= 0 or daily_limit <= 0:
         raise ValueError("prior limits must be positive")
@@ -71,6 +124,7 @@ def run_priors(
     )
 
     book_client = books or PolymarketBookClient()
+    facts_client = liquipedia or (LiquipediaClient() if use_liquipedia else None)
     created: List[Dict[str, Any]] = []
     errors: List[str] = []
     skipped = 0
@@ -87,6 +141,24 @@ def run_priors(
                 )
                 break
             record = _record_from_row(row)
+            verified, grounded = gather_facts(database, row, facts_client)
+            # No facts, no forecast. A prior with nothing to reason from is
+            # the failure mode that invalidated the first cohort: it looks
+            # like a view, unlocks the paper engine, and is really just a
+            # paraphrase of whatever text happened to be in the prompt.
+            if require_facts and grounded == 0:
+                skipped += 1
+                # Stamped so the queue moves on. Without it the same fixture is
+                # reselected every cycle, and with a small batch size a handful
+                # of teams that will never have a wiki page can starve every
+                # match that could actually be priced.
+                database.mark_prior_skipped(row["match_id"])
+                errors.append(
+                    "%s: no verified team facts; skipped rather than writing an "
+                    "ungrounded prior" % row["match_id"]
+                )
+                continue
+            record["verified_facts"] = verified
             cutoff = isoformat(utc_now())
             prompt_sha = hashlib.sha256(
                 build_prior_prompt(record, cutoff).encode("utf-8")
@@ -108,6 +180,8 @@ def run_priors(
                 model=model,
                 prompt_sha256=prompt_sha,
                 backend=backend_name or provider,
+                verified_facts=verified,
+                grounded_teams=grounded,
             )
             # Record what the market thought at this instant. Scoring the AI
             # against a price sampled at some other time measures timing, not
@@ -135,6 +209,7 @@ def run_priors(
                     "probability_a": parsed["probability_team_a"],
                     "confidence": parsed["confidence"],
                     "reasoning_summary": parsed["reasoning_summary"],
+                    "grounded_teams": grounded,
                 }
             )
             call_cost = float((parsed.get("usage") or {}).get("estimated_cost_usd", 0.0) or 0.0)

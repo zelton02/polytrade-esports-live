@@ -259,16 +259,22 @@ def run_cycle(
                 database, panda, live_by_provider, row, record, result, gate
             )
             quote = book_client.get_pair(match_id, row["token_a"], row["token_b"])
-            # A seed prior is the absence of a view, not a 50/50 view. Record
-            # the forecast for the dashboard, but do not size a position from it.
+            # Two ways a match has no view worth trading, and both produce a
+            # number that looks like one. A seed prior is the absence of a
+            # view. A prior written when only one team could be grounded is an
+            # abstention wearing a forecast's clothes: seen in production as a
+            # flat 0.50 with the reasoning "no verified data for ShindeN",
+            # which read as a +15% edge against a market at 0.345 and opened a
+            # position. Record both for the board; size neither.
             has_prior = str(row.get("prior_source") or "seed") != "seed"
+            fully_grounded = int(row.get("prior_grounded_teams") or 0) >= 2
             outcome = tick(
                 database=database,
                 state=state,
                 quote=quote,
                 account_name=settings.account_name,
                 paper_config=settings.paper,
-                paper_enabled=has_prior,
+                paper_enabled=has_prior and fully_grounded,
             )
             result.ticked += 1
             result.forecasts.append(

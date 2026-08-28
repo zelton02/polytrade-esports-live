@@ -179,6 +179,73 @@ const tests = {
     assert.strictEqual(body.children[0].children[1].textContent, "90.0%");
   },
 
+  "a prior whose evidence was not stored is not reported as absent"() {
+    // The panel once said "no prior was written" on a page that was showing
+    // the prior directly above it.
+    const { context, document } = boot();
+    const d = detail();
+    d.prior.verified_facts = "";
+    d.prior.grounded_teams = 1;
+    context.render(d);
+    const text = document.getElementById("d-facts").textContent;
+    assert.ok(!/no prior was written/i.test(text), text);
+    assert.ok(/predates the change/.test(text), text);
+    assert.ok(/1 of 2 teams grounded/.test(text), text);
+  },
+
+  "a match with no prior at all says so"() {
+    const { context, document } = boot();
+    context.render(detail({ prior: null, prior_source: "seed" }));
+    const text = document.getElementById("d-facts").textContent;
+    assert.ok(/No prior was written/.test(text), text);
+  },
+
+  "an ungrounded prior without evidence is flagged unverified"() {
+    const { context, document } = boot();
+    const d = detail();
+    d.prior.verified_facts = "";
+    d.prior.grounded_teams = 0;
+    context.render(d);
+    const text = document.getElementById("d-facts").textContent;
+    assert.ok(/unverified/.test(text), text);
+  },
+
+  "a stored evidence block is shown verbatim"() {
+    const { context, document } = boot();
+    const d = detail();
+    d.prior.verified_facts = "G2 (Liquipedia: G2 Esports)\n  roster: r1nkle (since 2026-06-25)";
+    d.prior.grounded_teams = 2;
+    context.render(d);
+    const text = document.getElementById("d-facts").textContent;
+    assert.ok(/r1nkle \(since 2026-06-25\)/.test(text), text);
+    assert.ok(/2 of 2 teams grounded/.test(text), text);
+  },
+
+  "the observation log is populated but starts collapsed"() {
+    // It is the audit trail behind the chart, so it must stay reachable; a
+    // hundred rows of ticks is not what the page opens with.
+    const { context, document } = boot();
+    context.render(detail({
+      history: [
+        point({ forecast_at: "2026-08-28T09:00:00Z", probability_a: 0.10 }),
+        point({ forecast_at: "2026-08-28T10:00:00Z", probability_a: 0.90 }),
+      ],
+    }));
+    const body = document.getElementById("d-obs");
+    assert.strictEqual(body.children.length, 2, "rows must still be rendered");
+    assert.strictEqual(document.getElementById("d-obs-count").textContent, "[2]");
+  },
+
+  "the count tells you what is inside before you open it"() {
+    const { context, document } = boot();
+    const many = [];
+    for (let i = 0; i < 40; i += 1) {
+      many.push(point({ forecast_at: "2026-08-28T09:" + String(i).padStart(2, "0") + ":00Z" }));
+    }
+    context.render(detail({ history: many }));
+    assert.strictEqual(document.getElementById("d-obs-count").textContent, "[40]");
+  },
+
   "a missing match id fails loudly"() {
     const { context, document } = boot("/match/");
     context.refresh();

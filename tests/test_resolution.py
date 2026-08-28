@@ -466,3 +466,125 @@ class ScoringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MethodologyGateTests(unittest.TestCase):
+    """A prior with nothing to reason from must not be scored as a forecast."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.temp.name) / "m.sqlite3"))
+        self.db.initialize()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _priced(self, match_id, backend, prompt_version, ai=0.8, market=0.5):
+        old = isoformat(utc_now() - timedelta(hours=6))
+        self.db.add_match(Match(match_id, "A Team", "B Team", 3, 0.5, scheduled_at=old))
+        prior_id = self.db.apply_prior(
+            match_id=match_id,
+            parsed={
+                "probability_team_a": ai, "raw_probability_team_a": ai,
+                "confidence": "low", "reasoning_summary": "t",
+                "evidence_cutoff_at": old, "prompt_version": prompt_version,
+                "usage": {},
+            },
+            provider="deepseek", model="deepseek-v4-pro", backend=backend,
+        )
+        self.db.set_prior_market_probability(prior_id, market)
+        self.db.resolve_match(match_id, "A", isoformat(utc_now()))
+        return prior_id
+
+    def test_first_generation_api_priors_are_excluded_from_scoring(self):
+        self._priced("m1", "deepseek", "cs2-prior-v1")
+        self.db.initialize()  # migrations re-run on every open
+        self.assertEqual(score(self.db)["ai"]["n"], 0)
+
+    def test_the_rows_are_kept_with_a_stated_reason(self):
+        self._priced("m1", "deepseek", "cs2-prior-v1")
+        self.db.initialize()
+        row = self.db.latest_prior("m1")
+        self.assertIsNotNone(row, "the prior must not be deleted")
+        self.assertIn("ungrounded", row["methodology"])
+
+    def test_web_researched_priors_are_still_scored(self):
+        self._priced("m2", "hermes", "cs2-prior-v1")
+        self.db.initialize()
+        self.assertEqual(score(self.db)["ai"]["n"], 1)
+
+    def test_a_later_grounded_prompt_version_is_scored(self):
+        self._priced("m3", "deepseek", "cs2-prior-v2-liquipedia")
+        self.db.initialize()
+        self.assertEqual(score(self.db)["ai"]["n"], 1)
+
+    def test_invalidation_is_idempotent(self):
+        self._priced("m1", "deepseek", "cs2-prior-v1")
+        for _ in range(3):
+            self.db.initialize()
+        self.assertEqual(self.db.latest_prior("m1")["methodology"].count("ungrounded"), 1)
+
+    def test_the_match_returns_to_the_pricing_queue(self):
+        # Invalidating the prior is not enough: the match kept the discredited
+        # probability, still read as priced, and so was never re-forecast.
+        soon = isoformat(utc_now() + timedelta(hours=3))
+        self.db.add_match(Match("m9", "A Team", "B Team", 3, 0.5, scheduled_at=soon))
+        with self.db.connect() as c:
+            c.execute("UPDATE matches SET liquidity=50000 WHERE match_id='m9'")
+        self.db.apply_prior(
+            match_id="m9",
+            parsed={
+                "probability_team_a": 0.8, "raw_probability_team_a": 0.8,
+                "confidence": "low", "reasoning_summary": "t",
+                "evidence_cutoff_at": isoformat(utc_now()),
+                "prompt_version": "cs2-prior-v1", "usage": {},
+            },
+            provider="deepseek", model="deepseek-v4-pro", backend="deepseek",
+        )
+        self.assertEqual(self.db.matches_needing_prior(limit=5), [])
+        self.db.initialize()
+        queue = [r["match_id"] for r in self.db.matches_needing_prior(limit=5)]
+        self.assertIn("m9", queue, "an invalidated match must be re-priceable")
+        self.assertAlmostEqual(self.db.get_match("m9").prior_probability_a, 0.5)
+
+    def test_a_match_with_a_sound_prior_is_left_alone(self):
+        soon = isoformat(utc_now() + timedelta(hours=3))
+        self.db.add_match(Match("m10", "A Team", "B Team", 3, 0.5, scheduled_at=soon))
+        self.db.apply_prior(
+            match_id="m10",
+            parsed={
+                "probability_team_a": 0.7, "raw_probability_team_a": 0.7,
+                "confidence": "medium", "reasoning_summary": "t",
+                "evidence_cutoff_at": isoformat(utc_now()),
+                "prompt_version": "cs2-prior-v2-liquipedia", "usage": {},
+            },
+            provider="deepseek", model="deepseek-v4-pro", backend="deepseek",
+        )
+        self.db.initialize()
+        self.assertAlmostEqual(self.db.get_match("m10").prior_probability_a, 0.7)
+        self.assertNotEqual(self.db.get_match("m10").source, "seed")
+
+    def test_grounded_priors_predating_the_column_are_recovered(self):
+        # The column was added after the first grounded priors were written,
+        # so they defaulted to zero and the board reported none.
+        soon = isoformat(utc_now() + timedelta(hours=3))
+        self.db.add_match(Match("m11", "A Team", "B Team", 3, 0.5, scheduled_at=soon))
+        self.db.apply_prior(
+            match_id="m11",
+            parsed={
+                "probability_team_a": 0.7, "raw_probability_team_a": 0.7,
+                "confidence": "medium", "reasoning_summary": "t",
+                "evidence_cutoff_at": isoformat(utc_now()),
+                "prompt_version": "cs2-prior-v2-liquipedia", "usage": {},
+            },
+            provider="deepseek", model="deepseek-v4-pro", backend="deepseek",
+        )
+        with self.db.connect() as c:
+            c.execute("UPDATE llm_priors SET grounded_teams=0 WHERE match_id='m11'")
+        self.db.initialize()
+        self.assertEqual(self.db.latest_prior("m11")["grounded_teams"], 1)
+
+    def test_invalidated_priors_are_not_marked_grounded(self):
+        self._priced("m12", "deepseek", "cs2-prior-v1")
+        self.db.initialize()
+        self.assertEqual(self.db.latest_prior("m12")["grounded_teams"], 0)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from polytrade_esports.engine import tick
 from polytrade_esports.storage import Database
+from polytrade_esports.timeutil import isoformat, utc_now
 from polytrade_esports.types import BookQuote, LiveState, Match
 
 
@@ -66,3 +67,70 @@ class EnginePaperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleModelGuardTests(unittest.TestCase):
+    """Entry must not open on an edge created purely by market movement.
+
+    Reconstructed from a real sequence: the model sat at 0.210 for five hours
+    at 0-0 while the market ran 0.205 -> 0.425 -> 0.085. The 0.085 was map one
+    ending. The engine read it as a 12-point edge, bought at 0.09, and sold
+    flat a minute later once the state feed finally caught up.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.temp.name) / "d.sqlite3"))
+        self.db.initialize()
+        self.db.ensure_account("live-paper", 1000.0)
+        self.db.add_match(Match("m1", "M80", "FURIA", 3, 0.21))
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _tick(self, ask_a, bid_a, maps=(0, 0)):
+        now = isoformat(utc_now())
+        state = LiveState("m1", now, maps[0], maps[1], 0, 0, observed_at=now).normalized()
+        quote = BookQuote(
+            "m1", bid_a, ask_a, 1 - ask_a - 0.01, 1 - bid_a, now, now, "test"
+        ).normalized()
+        return tick(self.db, state, quote, account_name="live-paper")
+
+    def test_an_edge_from_market_movement_alone_does_not_open_a_position(self):
+        self._tick(ask_a=0.21, bid_a=0.20)
+        result = self._tick(ask_a=0.09, bid_a=0.08)
+        self.assertGreater(result["edge_a"], 0.10, "the raw edge should look tradable")
+        self.assertLess(result["market_drift"], -0.08)
+        self.assertEqual(result["paper_actions"], [], "blindness is not an edge")
+
+    def test_a_state_change_re_anchors_and_lets_the_edge_trade(self):
+        self._tick(ask_a=0.21, bid_a=0.20)
+        self.assertEqual(self._tick(ask_a=0.09, bid_a=0.08)["paper_actions"], [])
+        moved = self._tick(ask_a=0.09, bid_a=0.08, maps=(1, 0))
+        self.assertAlmostEqual(moved["market_drift"], 0.0, places=6)
+        self.assertTrue(
+            any(a["action"] == "BUY" for a in moved["paper_actions"]),
+            "an edge our own feed has seen should trade",
+        )
+
+    def test_the_guard_never_blocks_an_exit(self):
+        self._tick(ask_a=0.21, bid_a=0.20)
+        self._tick(ask_a=0.09, bid_a=0.08)
+        opened = self._tick(ask_a=0.09, bid_a=0.08, maps=(1, 0))
+        self.assertTrue(any(a["action"] == "BUY" for a in opened["paper_actions"]))
+        # The market now runs far away with no state change of our own.
+        closed = self._tick(ask_a=0.95, bid_a=0.94, maps=(1, 0))
+        self.assertGreater(abs(closed["market_drift"]), 0.08)
+        self.assertTrue(
+            any(a["action"] == "SELL" for a in closed["paper_actions"]),
+            "being blind is a reason to stop buying, never to hold on",
+        )
+
+    def test_the_anchor_survives_repeated_ticks_of_an_unchanged_state(self):
+        # Each tick writes a new state row because source_at moves, so keying
+        # the anchor on state_id made the drift permanently zero and the guard
+        # inert. The anchor has to follow the state's content.
+        self._tick(ask_a=0.21, bid_a=0.20)
+        for _ in range(4):
+            result = self._tick(ask_a=0.20, bid_a=0.19)
+        self.assertAlmostEqual(result["market_drift"], -0.010, places=3)

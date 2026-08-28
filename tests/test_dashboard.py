@@ -16,6 +16,69 @@ from polytrade_esports.types import Match
 PASSWORD = "correct horse"
 
 
+class StylesheetTests(unittest.TestCase):
+    """Guards for layout rules that are easy to delete and hard to notice.
+
+    Team and tournament names come from a third party and can be long. Grid and
+    flex children default to min-width:auto, which refuses to shrink below the
+    content width, so without an explicit min-width:0 those names push the card
+    past the viewport on a phone. It looks fine on a desktop, which is exactly
+    why it needs a test.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from polytrade_esports.dashboard import WEB_ROOT
+
+        cls.web = WEB_ROOT
+        cls.css = (WEB_ROOT / "app.css").read_text()
+
+    def test_text_bearing_containers_can_shrink(self):
+        for selector in (".meta > *", ".board > *", ".subline > *"):
+            self.assertIn(
+                selector,
+                self.css,
+                "%s needs an explicit min-width:0 or long names overflow" % selector,
+            )
+        self.assertIn("min-width: 0", self.css)
+
+    def test_flexible_track_uses_minmax_not_bare_fr(self):
+        # `1fr` is shorthand for minmax(auto, 1fr); the auto minimum is the
+        # overflow. The board must use minmax(0, 1fr).
+        self.assertIn("grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)", self.css)
+
+    def test_long_names_are_truncated_rather_than_wrapped(self):
+        self.assertIn("text-overflow: ellipsis", self.css)
+
+    def test_a_phone_breakpoint_exists_for_the_card_grid(self):
+        self.assertIn("@media (max-width: 620px)", self.css)
+        self.assertIn("grid-template-columns: 1fr;", self.css)
+
+    def test_the_board_filter_is_styled_and_reachable(self):
+        # The default hides most of the slate, so the control that reverses it
+        # has to be visible rather than a hidden keyboard trick.
+        self.assertIn(".toggle", self.css)
+        self.assertIn('aria-pressed="true"', (self.web / "index.html").read_text())
+        self.assertIn('id="filter-toggle"', (self.web / "index.html").read_text())
+
+    def test_numeric_headers_align_with_their_values(self):
+        # A left-aligned header over a right-aligned column reads as a whole
+        # column of offset: SHARES looked empty and its values looked like
+        # prices.
+        self.assertIn("th.num, td.num { text-align: right; }", self.css)
+
+    def test_the_observation_log_starts_collapsed(self):
+        # <details> without the open attribute; the audit trail stays
+        # reachable without opening the page on a hundred rows of ticks.
+        html = (self.web / "detail.html").read_text()
+        self.assertIn('<details class="fold">', html)
+        self.assertNotIn('<details class="fold" open', html)
+        self.assertIn('id="d-obs"', html)
+
+    def test_motion_can_be_turned_off(self):
+        self.assertIn("prefers-reduced-motion", self.css)
+
+
 class DashboardAuthTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

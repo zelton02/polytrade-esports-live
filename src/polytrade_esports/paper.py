@@ -10,12 +10,17 @@ from .types import BookQuote
 class PaperConfig:
     min_entry_edge: float = 0.10
     exit_edge: float = 0.00
+    # How far the market may travel, while our own state feed says nothing new,
+    # before an apparent edge is treated as ignorance rather than opportunity.
+    max_market_drift: float = 0.08
     max_match_fraction: float = 0.01
     kelly_scale: float = 0.25
 
     def validate(self) -> None:
         if not 0.0 <= self.exit_edge <= self.min_entry_edge < 1.0:
             raise ValueError("require 0 <= exit_edge <= min_entry_edge < 1")
+        if not 0.0 < self.max_market_drift <= 1.0:
+            raise ValueError("max_market_drift must be in (0, 1]")
         if not 0.0 < self.max_match_fraction <= 0.10:
             raise ValueError("max_match_fraction must be in (0, 0.10]")
         if not 0.0 < self.kelly_scale <= 1.0:
@@ -44,6 +49,7 @@ def rebalance(
     probability_a: float,
     quote: BookQuote,
     config: Optional[PaperConfig] = None,
+    market_drift: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     settings = config or PaperConfig()
     settings.validate()
@@ -59,6 +65,23 @@ def rebalance(
     }
     candidate = "A" if edge["A"] >= edge["B"] else "B"
     entry_side = candidate if edge[candidate] + 1e-12 >= settings.min_entry_edge else None
+
+    # The model only moves when the state feed moves. Between state changes it
+    # is a constant, so any edge that opened up in that window is entirely the
+    # market moving -- which means the market has learned something the feed
+    # has not shown us, and the "edge" is our blindness, not their error.
+    #
+    # Observed cost of not having this guard: the model sat at 0.210 for five
+    # hours at 0-0 while the market ran from 0.205 to 0.425 and back to 0.085.
+    # The 0.085 was map one ending. We read it as a 12-point edge, bought, and
+    # sold flat a minute later once our own feed caught up.
+    #
+    # Exits are deliberately left alone: being blind is a reason to stop
+    # opening positions, never a reason to keep one you would otherwise close.
+    if entry_side is not None and market_drift is not None:
+        if abs(float(market_drift)) > settings.max_market_drift:
+            entry_side = None
+
     actions: List[Dict[str, Any]] = []
 
     with database.connect() as connection:

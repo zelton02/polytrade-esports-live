@@ -26,7 +26,10 @@ from urllib.request import Request, urlopen
 
 from .timeutil import isoformat, utc_now
 
-PROMPT_VERSION = "cs2-prior-v1"
+# Bumped when the prompt changes in a way that changes what the model is
+# reasoning from. v1 had only the market summary; v2 carries fetched
+# Liquipedia facts. Cohorts must not be mixed across versions.
+PROMPT_VERSION = "cs2-prior-v2-liquipedia"
 DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_PROVIDER = "deepseek"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -45,8 +48,8 @@ RESEARCH_CLAUSE = " You may use read-only web research."
 NO_RESEARCH_CLAUSE = (
     " You have no web access and no tools. Do not claim to have looked anything"
     " up, and never invent a source URL: leave supporting_evidence empty rather"
-    " than filling it. Reason only from your own knowledge and the untrusted"
-    " block below, and let the confidence field carry how thin that is."
+    " than filling it. Reason from the blocks below and from your own knowledge,"
+    " and let the confidence field carry how thin that basis is."
 )
 # Keep the prior away from 0/1: Match.validated() rejects the endpoints, and a
 # pre-match certainty claim is never justified for a best-of series anyway.
@@ -258,6 +261,54 @@ class DeepSeekBackend:
         return BackendResponse(content, usage)
 
 
+def format_team_facts(name: str, facts: Optional[Dict[str, Any]]) -> str:
+    """Render fetched Liquipedia facts as a compact, quotable block.
+
+    Kept plain and dated so the model can cite a specific roster change or
+    result instead of gesturing at "recent form".
+    """
+    if not facts or facts.get("error"):
+        reason = (facts or {}).get("error") or "not fetched"
+        return "%s: no verified data available (%s)" % (name, reason)
+
+    lines = ["%s (Liquipedia: %s)" % (name, facts.get("page") or "?")]
+    roster = facts.get("roster") or []
+    if roster:
+        lines.append(
+            "  roster: "
+            + ", ".join(
+                "%s (since %s)" % (p.get("id"), p.get("joined")) for p in roster[:6]
+            )
+        )
+    record = facts.get("record") or {}
+    if record:
+        lines.append(
+            "  record: %.0f%% of matches, %.0f%% of maps, %.1f%% of rounds won "
+            "(%dW-%dL)"
+            % (
+                record.get("match_win_pct", 0.0),
+                record.get("map_win_pct", 0.0),
+                record.get("round_win_pct", 0.0),
+                record.get("matches_won", 0),
+                record.get("matches_lost", 0),
+            )
+        )
+    recent = facts.get("recent") or []
+    if recent:
+        lines.append("  recent results (newest first):")
+        for item in recent[:8]:
+            lines.append(
+                "    %s | %s | %s vs %s"
+                % (
+                    item.get("played_at", ""),
+                    item.get("tier", ""),
+                    item.get("score", ""),
+                    item.get("opponent", ""),
+                )
+            )
+    return "\n".join(lines)
+
+
 def build_prior_prompt(
     record: Dict[str, Any], evidence_cutoff_at: str, web_research: bool = True
 ) -> str:
@@ -268,6 +319,15 @@ def build_prior_prompt(
     it never performed, which is the worst possible failure here: a confident
     number backed by an invented citation.
     """
+    # Liquipedia text is third-party too. The untrusted block is already
+    # escaped; leaving this one raw meant a team name containing the closing
+    # tag could break out of its own fence.
+    verified = (
+        str(record.get("verified_facts") or "")
+        .strip()
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
     untrusted = json.dumps(
         {
             "team_a": str(record.get("team_a") or "")[:200],
@@ -304,6 +364,16 @@ evidence is strong.
 %s
 </untrusted_match_data>
 
+<verified_team_data source="liquipedia.net">
+%s
+</verified_team_data>
+
+The <verified_team_data> block was fetched by this system from Liquipedia, not
+supplied by the market and not recalled from memory. Prefer it over anything in
+the untrusted block, and prefer it over your own recollection: your training
+data is older than this match and rosters change. Where the two blocks
+disagree, say so and follow the verified data.
+
 Estimate the probability that team_a wins the series. Return exactly one JSON
 object, with no markdown or surrounding commentary, using this schema:
 {
@@ -326,6 +396,7 @@ missing data. If you found little reliable information, say so and stay near
         record.get("scheduled_at") or "unknown",
         RESEARCH_CLAUSE if web_research else NO_RESEARCH_CLAUSE,
         untrusted,
+        verified or "No verified team data was retrieved for this match.",
     )
 
 

@@ -52,6 +52,14 @@ def tick(
         best_side=best_side,
         breakdown=breakdown.to_dict(),
     )
+    # Drift since our own view last had reason to change.
+    anchor_market = database.market_at_last_state_change(
+        match.match_id, normalized_state
+    )
+    market_drift = (
+        None if anchor_market is None
+        else normalized_quote.midpoint_a - anchor_market
+    )
     actions = (
         rebalance(
             database=database,
@@ -61,6 +69,7 @@ def tick(
             probability_a=probability_a,
             quote=normalized_quote,
             config=paper_config,
+            market_drift=market_drift,
         )
         if paper_enabled
         else []
@@ -78,6 +87,7 @@ def tick(
         "best_side": best_side,
         "paper_actions": actions,
         "paper_enabled": paper_enabled,
+        "market_drift": market_drift,
         "breakdown": breakdown.to_dict(),
         "forecast_at": forecast_at,
     }

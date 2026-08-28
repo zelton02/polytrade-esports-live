@@ -233,6 +233,48 @@ function renderAi(detail) {
   }
 }
 
+/* The exact block handed to the model, so a reader can check the stated
+   reasoning against its inputs rather than trusting the summary.
+
+   Three states, and they are not interchangeable: no prior at all, a prior
+   whose evidence was not retained, and a prior with its evidence. Collapsing
+   the middle case into the first told the reader "no prior was written" on a
+   page that was displaying the prior directly above. */
+function renderFacts(detail) {
+  var host = document.getElementById("d-facts");
+  host.textContent = "";
+  var prior = detail.prior;
+
+  if (!prior) {
+    host.appendChild(
+      el("div", "hint",
+        "No prior was written for this match. Liquipedia has no usable page for at least one of these teams, and a forecast with nothing to reason from is worse than none: it would read as a view and would unlock the paper engine.")
+    );
+    return;
+  }
+
+  var block = prior.verified_facts;
+  var grounded = prior.grounded_teams || 0;
+
+  if (!block || !String(block).trim()) {
+    host.appendChild(
+      el("div", "hint",
+        grounded > 0
+          ? "This prior was written from fetched Liquipedia data — " + grounded +
+            " of 2 teams grounded — but predates the change that stores the evidence block, so the exact text is not recoverable. Priors written from now on keep it."
+          : "No evidence block was stored with this prior, and it is not recorded as grounded. Treat its reasoning as unverified.")
+    );
+    return;
+  }
+
+  host.appendChild(
+    el("div", "hint",
+      "Fetched from Liquipedia before the scheduled start. " + grounded +
+      " of 2 teams grounded. Results at or after kick-off are excluded.")
+  );
+  host.appendChild(el("pre", "facts", block));
+}
+
 function renderBook(detail) {
   var host = document.getElementById("d-book");
   host.textContent = "";
@@ -396,6 +438,7 @@ function render(detail) {
   setText(document.getElementById("d-points"), "[" + (detail.history || []).length + "]");
   drawChart(detail.history || []);
   renderAi(detail);
+  renderFacts(detail);
   renderBook(detail);
   renderPaper(detail);
   renderObservations(detail);

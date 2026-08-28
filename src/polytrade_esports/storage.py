@@ -178,6 +178,17 @@ CREATE TABLE IF NOT EXISTS collector_runs (
 
 CREATE INDEX IF NOT EXISTS idx_collector_started
 ON collector_runs(started_at);
+
+-- Liquipedia facts are cached because action=parse is rate limited to one
+-- request per 30 seconds; refetching per forecast would make pricing a slate
+-- of matches take hours.
+CREATE TABLE IF NOT EXISTS team_facts (
+    team_name TEXT PRIMARY KEY,
+    page TEXT,
+    fetched_at TEXT NOT NULL,
+    facts_json TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT ''
+);
 """
 
 # The market's own probability at the instant the prior was made. Scoring the
@@ -189,6 +200,13 @@ PRIOR_COLUMNS = (
     # separate the cohorts -- and comparing a web-researched cohort against a
     # blind one is the whole point of keeping both.
     ("backend", "TEXT NOT NULL DEFAULT ''"),
+    # "sound", or a reason the prior must not be scored. Kept as a column
+    # rather than a deletion: how the method failed is itself a finding.
+    ("methodology", "TEXT NOT NULL DEFAULT 'sound'"),
+    # The exact facts block the model was given. Stored so a reader can check
+    # the reasoning against its inputs instead of taking the summary on trust.
+    ("verified_facts", "TEXT NOT NULL DEFAULT ''"),
+    ("grounded_teams", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 COLLECTOR_COLUMNS = (
@@ -201,6 +219,10 @@ COLLECTOR_COLUMNS = (
 # Esports start times slip routinely; a prior written just after the scheduled
 # time is still a pre-match prior in practice.
 GRACE_MINUTES = 20
+
+# Marks the first generation of API priors, which had no evidence to reason
+# from. See _invalidate_ungrounded_priors.
+REASON_UNGROUNDED = "ungrounded: no web access, no verified facts; the only input was the market own summary"
 
 # ALTER TABLE has no IF NOT EXISTS in SQLite; applied only when absent.
 MATCH_COLUMNS = (
@@ -218,6 +240,11 @@ MATCH_COLUMNS = (
     ("finished_observed_at", "TEXT"),
     ("liquidity", "REAL NOT NULL DEFAULT 0"),
     ("prior_source", "TEXT NOT NULL DEFAULT 'seed'"),
+    # When pricing was last abandoned for want of verifiable facts. A team with
+    # no wiki page still has none an hour later, so without this the same
+    # unpriceable fixtures reclaim the queue every cycle and starve the ones
+    # that could actually be priced.
+    ("prior_skipped_at", "TEXT"),
     ("updated_at", "TEXT"),
 )
 
@@ -269,7 +296,16 @@ class Database:
                 WHERE status IN ('resolved', 'void')
                 """
             )
+            # These rewrite rows rather than change the schema, and each is
+            # idempotent, so re-running them is cheap and safe. Gating them
+            # behind an applied-repairs ledger is the right long-term shape but
+            # changes migration semantics (a fresh database would mark them
+            # done immediately), so it belongs in its own change with its own
+            # tests rather than at the end of this one.
             self._label_legacy_backends(connection)
+            self._invalidate_ungrounded_priors(connection)
+            self._backfill_grounding(connection)
+            self._backfill_web_grounding(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
                 ("schema_version", "3"),
@@ -293,6 +329,89 @@ class Database:
             """
             UPDATE llm_priors SET backend='deepseek'
             WHERE backend='' AND evidence_json = '[]'
+            """
+        )
+
+    @staticmethod
+    def _backfill_web_grounding(connection: sqlite3.Connection) -> None:
+        """Credit web-researched priors that predate the grounding column.
+
+        A prior carrying cited sources was researched: the no-tool prompt
+        forbids producing evidence at all, so a non-empty evidence list can
+        only have come from a backend that actually looked the matchup up.
+        Both teams are credited because the research covered the fixture, not
+        one side of it.
+        """
+        connection.execute(
+            """
+            UPDATE llm_priors SET grounded_teams = 2
+            WHERE grounded_teams = 0
+              AND methodology = 'sound'
+              AND evidence_json <> '[]'
+            """
+        )
+
+    @staticmethod
+    def _backfill_grounding(connection: sqlite3.Connection) -> None:
+        """Mark priors that predate the grounded_teams column.
+
+        Sound inference rather than a guess: the grounded prompt version only
+        ever ran with require_facts on, and that path skips the match outright
+        when neither team can be grounded. A stored prior of that version
+        therefore had at least one grounded team. One is recorded rather than
+        two, because which it was is no longer knowable.
+        """
+        connection.execute(
+            """
+            UPDATE llm_priors SET grounded_teams = 1
+            WHERE grounded_teams = 0
+              AND methodology = 'sound'
+              AND prompt_version LIKE 'cs2-prior-v2%'
+            """
+        )
+
+    @staticmethod
+    def _invalidate_ungrounded_priors(connection: sqlite3.Connection) -> None:
+        """Exclude priors that had no independent evidence to reason from.
+
+        The early API-backed priors ran with no web access, a training cutoff
+        26 months before the matches, and nothing in the prompt but the
+        market machine-written summary. A controlled test showed the output
+        simply tracked that summary: removing it moved the estimate to 0.46,
+        and reversing it moved the estimate from 0.27 to 0.70. Those are
+        paraphrases of the market, not forecasts of it, so scoring them as an
+        independent view would measure nothing.
+
+        The rows stay; only their eligibility for scoring changes.
+        """
+        connection.execute(
+            """
+            UPDATE llm_priors SET methodology = ?
+            WHERE methodology = 'sound'
+              AND backend = 'deepseek'
+              AND prompt_version = 'cs2-prior-v1'
+            """,
+            (REASON_UNGROUNDED,),
+        )
+        # Invalidating the prior is only half the job. The match still carries
+        # the discredited probability and still reads as priced, so it never
+        # re-enters the pricing queue and the bad number stays on the board.
+        # Reset any match whose only priors are unsound back to the seed.
+        connection.execute(
+            """
+            UPDATE matches
+            SET prior_probability_a = 0.5, prior_source = 'seed'
+            WHERE prior_source <> 'seed'
+              AND EXISTS (
+                  SELECT 1 FROM llm_priors p
+                  WHERE p.match_id = matches.match_id
+                    AND p.methodology <> 'sound'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM llm_priors p
+                  WHERE p.match_id = matches.match_id
+                    AND p.methodology = 'sound'
+              )
             """
         )
 
@@ -736,15 +855,28 @@ class Database:
             return "updated"
 
     def open_matches(self, only_live: bool = False) -> List[Dict[str, Any]]:
-        query = "SELECT * FROM matches WHERE status='open'"
+        # prior_grounded_teams rides along because the paper engine needs it:
+        # a forecast about a fixture where one side is unknown is not a view
+        # about that fixture, and must not size a position.
+        query = (
+            "SELECT m.*, ("
+            "  SELECT p.grounded_teams FROM llm_priors p"
+            "  WHERE p.match_id = m.match_id AND p.methodology = 'sound'"
+            "  ORDER BY p.created_at DESC, p.prior_id DESC LIMIT 1"
+            ") AS prior_grounded_teams "
+            "FROM matches m WHERE m.status='open'"
+        )
         if only_live:
-            query += " AND live=1"
-        query += " ORDER BY COALESCE(scheduled_at, created_at) ASC"
+            query += " AND m.live=1"
+        query += " ORDER BY COALESCE(m.scheduled_at, m.created_at) ASC"
         with self.connect() as connection:
             return [dict(row) for row in connection.execute(query).fetchall()]
 
     def matches_needing_prior(
-        self, limit: int = 10, min_liquidity: float = 0.0
+        self,
+        limit: int = 10,
+        min_liquidity: float = 0.0,
+        skip_backoff_hours: float = 6.0,
     ) -> List[Dict[str, Any]]:
         """Un-priced open matches, soonest to start first.
 
@@ -766,6 +898,9 @@ class Database:
         routine schedule slippage in esports.
         """
         cutoff = isoformat(utc_now() - timedelta(minutes=GRACE_MINUTES))
+        retry_after = isoformat(
+            utc_now() - timedelta(hours=float(skip_backoff_hours))
+        )
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -776,12 +911,21 @@ class Database:
                   AND m.liquidity >= ?
                   AND m.scheduled_at IS NOT NULL
                   AND m.scheduled_at >= ?
+                  AND (m.prior_skipped_at IS NULL OR m.prior_skipped_at < ?)
                 ORDER BY m.scheduled_at ASC, m.liquidity DESC
                 LIMIT ?
                 """,
-                (float(min_liquidity), cutoff, int(limit)),
+                (float(min_liquidity), cutoff, retry_after, int(limit)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def mark_prior_skipped(self, match_id: str) -> None:
+        """Record that pricing was abandoned for lack of verifiable facts."""
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE matches SET prior_skipped_at=? WHERE match_id=?",
+                (isoformat(utc_now()), match_id),
+            )
 
     def apply_prior(
         self,
@@ -791,6 +935,8 @@ class Database:
         model: str,
         prompt_sha256: str = "",
         backend: str = "",
+        verified_facts: str = "",
+        grounded_teams: int = 0,
     ) -> int:
         """Record an LLM prior and promote it onto the match, atomically."""
         usage = parsed.get("usage") or {}
@@ -803,8 +949,8 @@ class Database:
                     prompt_version, probability_a, raw_probability_a, confidence,
                     reasoning_summary, key_factors_json, evidence_json,
                     assumptions_json, usage_json, estimated_cost_usd,
-                    prompt_sha256, backend, applied
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    prompt_sha256, backend, verified_facts, grounded_teams, applied
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     match_id,
@@ -824,6 +970,8 @@ class Database:
                     float(usage.get("estimated_cost_usd", 0.0) or 0.0),
                     prompt_sha256,
                     backend or provider,
+                    verified_facts,
+                    int(grounded_teams),
                 ),
             )
             connection.execute(
@@ -1027,6 +1175,7 @@ class Database:
                 JOIN llm_priors p ON p.prior_id = (
                     SELECT p2.prior_id FROM llm_priors p2
                     WHERE p2.match_id = m.match_id
+                      AND p2.methodology = 'sound'
                     ORDER BY p2.created_at ASC, p2.prior_id ASC LIMIT 1
                 )
                 LEFT JOIN forecasts f ON f.forecast_id = (
@@ -1066,6 +1215,8 @@ class Database:
                     p.confidence AS prior_confidence,
                     p.reasoning_summary AS prior_reasoning,
                     p.model AS prior_model,
+                    p.backend AS prior_backend,
+                    p.grounded_teams AS prior_grounded_teams,
                     p.created_at AS prior_created_at,
                     p.key_factors_json, p.evidence_json, p.assumptions_json
                 FROM matches m
@@ -1082,7 +1233,7 @@ class Database:
                 LEFT JOIN market_snapshots b ON b.book_id=f.book_id
                 LEFT JOIN llm_priors p ON p.prior_id = (
                     SELECT p2.prior_id FROM llm_priors p2
-                    WHERE p2.match_id=m.match_id
+                    WHERE p2.match_id=m.match_id AND p2.methodology='sound'
                     ORDER BY p2.created_at DESC, p2.prior_id DESC LIMIT 1
                 )
                 -- Stable ordering. Sorting by the latest forecast time made
@@ -1204,6 +1355,75 @@ class Database:
         detail["generated_at"] = isoformat(utc_now())
         return detail
 
+    def cached_team_facts(
+        self, team_name: str, max_age_hours: float = 12.0
+    ) -> Optional[Dict[str, Any]]:
+        cutoff = isoformat(utc_now() - timedelta(hours=float(max_age_hours)))
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM team_facts WHERE team_name=? AND fetched_at >= ?",
+                (team_name, cutoff),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["facts_json"])
+        value["cached_at"] = row["fetched_at"]
+        return value
+
+    def store_team_facts(self, team_name: str, facts: Dict[str, Any]) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO team_facts(team_name, page, fetched_at, facts_json, error)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(team_name) DO UPDATE SET
+                    page=excluded.page,
+                    fetched_at=excluded.fetched_at,
+                    facts_json=excluded.facts_json,
+                    error=excluded.error
+                """,
+                (
+                    team_name,
+                    facts.get("page") or "",
+                    isoformat(utc_now()),
+                    _json(facts),
+                    str(facts.get("error") or ""),
+                ),
+            )
+
+    def market_at_last_state_change(
+        self, match_id: str, state: Any
+    ) -> Optional[float]:
+        """Market midpoint when the state last actually changed.
+
+        Anchoring on ``state_id`` does not work: every tick stores a new state
+        row because ``source_at`` moves, so the "first forecast for this state"
+        is always the one just written and the drift is always zero. The
+        comparison has to be on the state's *content* -- maps and rounds --
+        which is the only thing that moves the model.
+        """
+        with self.connect() as connection:
+            changed_at = connection.execute(
+                """
+                SELECT max(f.forecast_at)
+                FROM forecasts f JOIN state_snapshots s ON s.state_id = f.state_id
+                WHERE f.match_id = ?
+                  AND (s.maps_a <> ? OR s.maps_b <> ?
+                       OR s.rounds_a <> ? OR s.rounds_b <> ?)
+                """,
+                (match_id, state.maps_a, state.maps_b, state.rounds_a, state.rounds_b),
+            ).fetchone()[0]
+            row = connection.execute(
+                """
+                SELECT f.market_midpoint_a
+                FROM forecasts f
+                WHERE f.match_id = ? AND f.forecast_at > COALESCE(?, '')
+                ORDER BY f.forecast_at ASC, f.forecast_id ASC LIMIT 1
+                """,
+                (match_id, changed_at),
+            ).fetchone()
+        return None if row is None else float(row["market_midpoint_a"])
+
     def account_payload(self, name: str = "live-paper") -> Dict[str, Any]:
         with self.connect() as connection:
             account = connection.execute(
@@ -1275,6 +1495,13 @@ class Database:
                 "priced": connection.execute(
                     "SELECT count(*) FROM matches WHERE prior_source != 'seed'"
                 ).fetchone()[0],
+                "grounded_priors": connection.execute(
+                    "SELECT count(*) FROM llm_priors WHERE methodology='sound' "
+                    "AND grounded_teams > 0"
+                ).fetchone()[0],
+                "excluded_priors": connection.execute(
+                    "SELECT count(*) FROM llm_priors WHERE methodology != 'sound'"
+                ).fetchone()[0],
                 "states": connection.execute("SELECT count(*) FROM state_snapshots").fetchone()[0],
                 "books": connection.execute("SELECT count(*) FROM market_snapshots").fetchone()[0],
                 "forecasts": connection.execute("SELECT count(*) FROM forecasts").fetchone()[0],
@@ -1303,4 +1530,8 @@ class Database:
 
         report = score(self)
         report["matches"] = report["matches"][:20]
+        with self.connect() as connection:
+            report["excluded"] = connection.execute(
+                "SELECT count(*) FROM llm_priors WHERE methodology != 'sound'"
+            ).fetchone()[0]
         return report

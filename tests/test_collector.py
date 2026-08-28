@@ -100,10 +100,53 @@ class CollectorTests(unittest.TestCase):
             },
             provider="test",
             model="test-model",
+            grounded_teams=2,
         )
         result = run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
         self.assertTrue(result.forecasts[0]["paper_enabled"])
         self.assertGreater(self.db.dashboard_payload()["counts"]["trades"], 0)
+
+    def test_a_half_grounded_prior_does_not_open_a_position(self):
+        """An abstention wearing a forecast's clothes must not size a trade.
+
+        Seen in production: a prior came back at a flat 0.50 with the reasoning
+        "No verified data for ShindeN", because only one team had a wiki page.
+        Against a market at 0.345 that read as a +15% edge and opened a
+        position. The number looks like a view; it is the absence of one.
+        """
+        run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        self.db.apply_prior(
+            match_id=FIXTURE["slug"],
+            parsed={
+                "probability_team_a": 0.5, "raw_probability_team_a": 0.5,
+                "confidence": "low", "reasoning_summary": "no verified data for one side",
+                "evidence_cutoff_at": isoformat(utc_now()),
+                "prompt_version": "cs2-prior-v2-liquipedia", "usage": {},
+            },
+            provider="deepseek", model="deepseek-v4-pro", grounded_teams=1,
+        )
+        result = run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        self.assertFalse(result.forecasts[0]["paper_enabled"])
+        self.assertEqual(self.db.dashboard_payload()["counts"]["trades"], 0)
+
+    def test_a_web_researched_prior_still_trades_after_backfill(self):
+        # Hermes priors predate the grounding column but cited real sources;
+        # the backfill must not leave them mute.
+        run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        self.db.apply_prior(
+            match_id=FIXTURE["slug"],
+            parsed={
+                "probability_team_a": 0.7, "raw_probability_team_a": 0.7,
+                "confidence": "medium", "reasoning_summary": "researched",
+                "supporting_evidence": [{"title": "t", "url": "https://hltv.org/x"}],
+                "evidence_cutoff_at": isoformat(utc_now()),
+                "prompt_version": "cs2-prior-v1", "usage": {},
+            },
+            provider="deepseek", model="deepseek-v4-pro", backend="hermes",
+        )
+        self.db.initialize()  # migrations backfill grounding
+        result = run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        self.assertTrue(result.forecasts[0]["paper_enabled"])
 
     def test_prior_is_recorded_and_surfaced_to_the_dashboard(self):
         run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
@@ -360,3 +403,47 @@ class CollectorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerSeparationTests(unittest.TestCase):
+    """Two signals must not share one equity curve.
+
+    Trades made under priors that were later invalidated stay in their own
+    account. Deleting them would erase the record of the mistake; mixing them
+    with the grounded cohort would make both curves unreadable.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.temp.name) / "l.sqlite3"))
+        self.db.initialize()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_accounts_keep_separate_cash_and_history(self):
+        old = self.db.ensure_account("live-paper", 1000.0)
+        new = self.db.ensure_account("grounded-paper", 1000.0)
+        self.assertNotEqual(old, new)
+        self.assertEqual(self.db.account_payload("grounded-paper")["cash"], 1000.0)
+
+    def test_a_new_account_starts_flat_whatever_the_old_one_did(self):
+        self.db.ensure_account("live-paper", 1000.0)
+        with self.db.connect() as c:
+            c.execute("UPDATE paper_accounts SET cash=723.5 WHERE name='live-paper'")
+        self.db.ensure_account("grounded-paper", 1000.0)
+        fresh = self.db.account_payload("grounded-paper")
+        self.assertEqual(fresh["cash"], 1000.0)
+        self.assertEqual(fresh["return"], 0.0)
+        self.assertEqual(fresh["trades"], [])
+
+    def test_the_old_ledger_is_still_readable(self):
+        self.db.ensure_account("live-paper", 1000.0)
+        with self.db.connect() as c:
+            c.execute("UPDATE paper_accounts SET cash=723.5 WHERE name='live-paper'")
+        self.assertAlmostEqual(self.db.account_payload("live-paper")["cash"], 723.5)
+
+    def test_the_collector_writes_where_it_is_told(self):
+        config = CollectorConfig(account_name="grounded-paper", pandascore_token="")
+        run_cycle(self.db, config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        self.assertIsNotNone(self.db.account_payload("grounded-paper"))

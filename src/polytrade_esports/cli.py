@@ -389,6 +389,7 @@ def cmd_forecast_priors(args: argparse.Namespace) -> None:
         model=args.model,
         dry_run=args.dry_run,
         backend_name=args.backend,
+        require_facts=not args.allow_ungrounded,
     )
     _print({"summary": summary, "priors": created})
 
@@ -433,6 +434,7 @@ def _loop_priors(database: Database, backend: Any, args: argparse.Namespace) -> 
                 model=args.model,
                 dry_run=False,
                 backend_name=args.backend,
+                require_facts=not args.allow_ungrounded,
             )
             print(
                 json.dumps(
@@ -628,6 +630,11 @@ def build_parser() -> argparse.ArgumentParser:
     priors.add_argument("--provider", default=DEFAULT_PROVIDER)
     priors.add_argument("--hermes-bin", default="/usr/local/bin/hermes")
     priors.add_argument("--timeout", type=float, default=300.0)
+    priors.add_argument(
+        "--allow-ungrounded",
+        action="store_true",
+        help="write a prior even when no verified team facts could be fetched",
+    )
     priors.add_argument("--dry-run", action="store_true")
     priors.add_argument(
         "--loop-seconds",

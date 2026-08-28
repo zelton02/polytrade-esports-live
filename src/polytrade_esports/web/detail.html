@@ -57,22 +57,29 @@
   </section>
 
   <section class="block">
+    <h2 class="head"><span class="bar"></span>EVIDENCE THE MODEL WAS GIVEN</h2>
+    <div class="panel" id="d-facts">&mdash;</div>
+  </section>
+
+  <section class="block">
     <h2 class="head"><span class="bar"></span>PAPER POSITION</h2>
     <div class="panel" id="d-paper">&mdash;</div>
   </section>
 
   <section class="block">
-    <h2 class="head"><span class="bar"></span>OBSERVATIONS<span class="count" id="d-obs-count"></span></h2>
-    <div class="scroller">
-      <table>
-        <thead><tr>
-          <th>TIME</th><th class="num">MODEL</th><th class="num">MARKET</th>
-          <th class="num">EDGE A</th><th class="num">EDGE B</th>
-          <th>MAPS</th><th>RDS</th><th>MAP</th><th>SOURCE</th>
-        </tr></thead>
-        <tbody id="d-obs"></tbody>
-      </table>
-    </div>
+    <details class="fold">
+      <summary><span class="bar"></span>OBSERVATIONS<span class="count" id="d-obs-count"></span><span class="fold-note">every recorded tick &mdash; the raw data behind the chart</span></summary>
+      <div class="scroller">
+        <table>
+          <thead><tr>
+            <th>TIME</th><th class="num">MODEL</th><th class="num">MARKET</th>
+            <th class="num">EDGE A</th><th class="num">EDGE B</th>
+            <th>MAPS</th><th>RDS</th><th>MAP</th><th>SOURCE</th>
+          </tr></thead>
+          <tbody id="d-obs"></tbody>
+        </table>
+      </div>
+    </details>
   </section>
 </main>
 
