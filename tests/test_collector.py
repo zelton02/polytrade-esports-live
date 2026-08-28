@@ -8,7 +8,7 @@ import polytrade_esports.collector as collector_module
 from polytrade_esports.collector import CollectorConfig, GameDetailGate, run_cycle
 from polytrade_esports.storage import Database
 from polytrade_esports.timeutil import isoformat, utc_now
-from polytrade_esports.types import BookQuote
+from polytrade_esports.types import BookQuote, LiveState
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "gamma_cs2_event.json").read_text()
@@ -50,6 +50,44 @@ class FakeBooks:
             source_at=now,
             observed_at=now,
             source="test",
+        ).normalized()
+
+
+class FakeSports:
+    connected = True
+
+    def state_for(self, provider_match_id, match_id, team_a, team_b):
+        if str(provider_match_id) != "1648237":
+            return None
+        now = isoformat(utc_now())
+        return LiveState(
+            match_id=match_id,
+            source_at=now,
+            observed_at=now,
+            maps_a=0,
+            maps_b=0,
+            rounds_a=6,
+            rounds_b=1,
+            current_map="Map 1",
+            source="polymarket-sports-ws",
+        ).normalized()
+
+
+class FakeMapsOnlySports(FakeSports):
+    def state_for(self, provider_match_id, match_id, team_a, team_b):
+        state = super().state_for(provider_match_id, match_id, team_a, team_b)
+        if state is None:
+            return None
+        return LiveState(
+            match_id=match_id,
+            source_at=state.source_at,
+            observed_at=state.observed_at,
+            maps_a=1,
+            maps_b=0,
+            rounds_a=0,
+            rounds_b=0,
+            current_map="Map 2",
+            source="polymarket-sports-ws-maps",
         ).normalized()
 
 
@@ -102,9 +140,49 @@ class CollectorTests(unittest.TestCase):
             model="test-model",
             grounded_teams=2,
         )
-        result = run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        result = run_cycle(
+            self.db,
+            self.config,
+            gamma=FakeGamma([live_event()]),
+            books=FakeBooks(),
+            sports=FakeSports(),
+        )
         self.assertTrue(result.forecasts[0]["paper_enabled"])
+        self.assertTrue(result.forecasts[0]["entry_enabled"])
+        self.assertEqual(
+            result.forecasts[0]["state_source"],
+            "polymarket-sports-ws",
+        )
         self.assertGreater(self.db.dashboard_payload()["counts"]["trades"], 0)
+
+    def test_live_maps_only_state_pauses_entries_but_keeps_forecasting(self):
+        run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
+        self.db.apply_prior(
+            match_id=FIXTURE["slug"],
+            parsed={
+                "probability_team_a": 0.7,
+                "raw_probability_team_a": 0.7,
+                "confidence": "medium",
+                "reasoning_summary": "test",
+                "evidence_cutoff_at": isoformat(utc_now()),
+                "prompt_version": "test",
+                "usage": {},
+            },
+            provider="test",
+            model="test-model",
+            grounded_teams=2,
+        )
+        result = run_cycle(
+            self.db,
+            self.config,
+            gamma=FakeGamma([live_event()]),
+            books=FakeBooks(),
+        )
+        self.assertEqual(result.ticked, 1)
+        self.assertTrue(result.forecasts[0]["paper_enabled"])
+        self.assertFalse(result.forecasts[0]["entry_enabled"])
+        self.assertIn(collector_module.ROUND_FEED_NOTICE, result.notices)
+        self.assertEqual(self.db.dashboard_payload()["counts"]["trades"], 0)
 
     def test_a_half_grounded_prior_does_not_open_a_position(self):
         """An abstention wearing a forecast's clothes must not size a trade.
@@ -337,16 +415,23 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(first.ticked, 1)
         self.assertEqual(second.ticked, 1)
         self.assertEqual(second.errors, [], "the refusal must not repeat every cycle")
-        self.assertEqual(second.notices, [], "the notice must not repeat either")
+        self.assertEqual(
+            second.notices,
+            [collector_module.ROUND_FEED_NOTICE],
+            "the persistent live-feed limitation remains visible",
+        )
         self.assertEqual(
             self.db.latest_collector_run()["notices"],
-            [collector_module.MAPS_ONLY_NOTICE],
+            [
+                collector_module.MAPS_ONLY_NOTICE,
+                collector_module.ROUND_FEED_NOTICE,
+            ],
             "the effective maps-only capability must remain visible",
         )
         self.assertEqual(
             first.errors, [], "a plan limitation is a notice, not a failure"
         )
-        self.assertEqual(len(first.notices), 1)
+        self.assertEqual(len(first.notices), 2)
         self.assertEqual(
             self.db.latest_collector_run()["status"],
             "completed",
@@ -392,6 +477,67 @@ class CollectorTests(unittest.TestCase):
         row = self.db.dashboard_payload()["matches"][0]
         self.assertEqual((row["maps_a"], row["maps_b"]), (1, 0))
         self.assertEqual(row["current_map"], "MAP 2")
+
+    def test_pandascore_rounds_beat_a_sports_maps_only_placeholder(self):
+        class RoundPanda:
+            def running_matches(self, per_page=50):
+                return [
+                    {
+                        "id": 1648237,
+                        "opponents": [
+                            {"opponent": {"id": 1, "name": "Lavked"}},
+                            {
+                                "opponent": {
+                                    "id": 2,
+                                    "name": "Esport Academy Copenhagen",
+                                }
+                            },
+                        ],
+                        "results": [
+                            {"team_id": 1, "score": 1},
+                            {"team_id": 2, "score": 0},
+                        ],
+                        "games": [
+                            {
+                                "id": 7,
+                                "position": 2,
+                                "status": "running",
+                                "teams": [
+                                    {"team_id": 1, "score": 9},
+                                    {"team_id": 2, "score": 6},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+
+            def game(self, game_id):
+                return {
+                    "id": game_id,
+                    "teams": [
+                        {"team_id": 1, "score": 9},
+                        {"team_id": 2, "score": 6},
+                    ],
+                }
+
+        original = collector_module.PandaScoreClient
+        collector_module.PandaScoreClient = lambda token: RoundPanda()
+        collector_module._GAME_DETAIL_GATE = GameDetailGate()
+        try:
+            run_cycle(
+                self.db,
+                CollectorConfig(pandascore_token="x"),
+                gamma=FakeGamma([live_event()]),
+                books=FakeBooks(),
+                sports=FakeMapsOnlySports(),
+            )
+        finally:
+            collector_module.PandaScoreClient = original
+            collector_module._GAME_DETAIL_GATE = None
+
+        state = self.db.latest_state(FIXTURE["slug"])
+        self.assertEqual(state.source, "pandascore")
+        self.assertEqual((state.rounds_a, state.rounds_b), (9, 6))
 
     def test_run_is_recorded_for_freshness_reporting(self):
         run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())

@@ -50,6 +50,7 @@ def rebalance(
     quote: BookQuote,
     config: Optional[PaperConfig] = None,
     market_drift: Optional[float] = None,
+    entry_enabled: bool = True,
 ) -> List[Dict[str, Any]]:
     settings = config or PaperConfig()
     settings.validate()
@@ -65,6 +66,11 @@ def rebalance(
     }
     candidate = "A" if edge["A"] >= edge["B"] else "B"
     entry_side = candidate if edge[candidate] + 1e-12 >= settings.min_entry_edge else None
+
+    # A stale or disconnected live-state feed may still be used to mark books
+    # and reduce existing risk, but never to open or increase a position.
+    if not entry_enabled:
+        entry_side = None
 
     # The model only moves when the state feed moves. Between state changes it
     # is a constant, so any edge that opened up in that window is entirely the

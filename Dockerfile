@@ -9,6 +9,8 @@ RUN useradd --system --uid 10002 --create-home collector \
     && mkdir -p /app/data \
     && chown -R collector:collector /app
 
+RUN python -m pip install --no-cache-dir websockets==15.0.1
+
 WORKDIR /app
 COPY --chown=collector:collector src /app/src
 

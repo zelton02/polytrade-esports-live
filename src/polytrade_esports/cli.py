@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from .collector import CollectorConfig, run_cycle, run_loop
+from .collector import CollectorConfig, run_loop
 from .dashboard import serve
 from .engine import tick
 from .gamma import GammaClient, parse_event
@@ -270,6 +270,10 @@ def _collector_config(args: argparse.Namespace) -> CollectorConfig:
         max_pages=args.max_pages,
         paper=_paper_config(args),
         pandascore_token=os.environ.get(PANDASCORE_TOKEN_ENV, ""),
+        sports_ws_enabled=args.sports_ws_enabled,
+        sports_ws_url=args.sports_ws_url,
+        sports_max_age_seconds=args.sports_max_age_seconds,
+        sports_startup_wait_seconds=args.sports_startup_wait_seconds,
         max_match_age_hours=args.max_match_age_hours,
         resolve_every_cycles=args.resolve_every_cycles,
     )
@@ -326,7 +330,15 @@ def cmd_collect(args: argparse.Namespace) -> None:
     database = Database(args.db)
     config = _collector_config(args)
     if args.cycles == 1:
-        _print(run_cycle(database, config).to_dict())
+        completed = []
+        run_loop(
+            database=database,
+            config=config,
+            interval_seconds=args.interval_seconds,
+            cycles=1,
+            on_cycle=completed.append,
+        )
+        _print(completed[0].to_dict())
         return
     run_loop(
         database=database,
@@ -607,8 +619,20 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--max-pages", type=int, default=6)
     collect.add_argument("--max-match-age-hours", type=float, default=12.0)
     collect.add_argument("--resolve-every-cycles", type=int, default=30)
+    collect.add_argument(
+        "--no-sports-ws",
+        action="store_false",
+        dest="sports_ws_enabled",
+        help="disable the Polymarket Sports WebSocket round feed",
+    )
+    collect.add_argument(
+        "--sports-ws-url",
+        default="wss://sports-api.polymarket.com/ws",
+    )
+    collect.add_argument("--sports-max-age-seconds", type=float, default=90.0)
+    collect.add_argument("--sports-startup-wait-seconds", type=float, default=5.0)
     _add_paper_arguments(collect)
-    collect.set_defaults(func=cmd_collect)
+    collect.set_defaults(func=cmd_collect, sports_ws_enabled=True)
 
     priors = subparsers.add_parser(
         "forecast-priors", help="LLM pre-match priors for un-priced matches"

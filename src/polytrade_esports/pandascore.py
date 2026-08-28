@@ -181,6 +181,16 @@ def _round_scores(game: Dict[str, Any], team_ids: List[Any]) -> Dict[Any, int]:
     return {}
 
 
+def _has_round_shape(game: Dict[str, Any]) -> bool:
+    """Whether a provider payload actually exposes round-level fields."""
+    for team in game.get("teams") or []:
+        if isinstance(team, dict) and (
+            team.get("score") is not None or team.get("rounds_won") is not None
+        ):
+            return True
+    return isinstance(game.get("rounds"), list)
+
+
 def _map_label(game: Dict[str, Any]) -> str:
     """Name the current map, or fall back to its position in the series.
 
@@ -285,7 +295,11 @@ def build_state(
         current_map=current_map,
         side_advantage_a=side_advantage_a,
         source=SOURCE,
-        raw={"match": match, "game": game or None},
+        raw={
+            "match": match,
+            "game": game or None,
+            "round_detail_available": bool(game_detail) or _has_round_shape(game),
+        },
     ).normalized()
 
 

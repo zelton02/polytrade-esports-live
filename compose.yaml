@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: polytrade-esports-live:0.2.2
+    image: polytrade-esports-live:0.3.0
     command:
       - python
       - -m
@@ -19,6 +19,8 @@ services:
       - "60"
       - --tick-window-hours
       - "3"
+      - --sports-max-age-seconds
+      - "90"
       # A fresh ledger for the grounded cohort. The previous account keeps its
       # history: 95% of its trades were driven by priors later found to be
       # paraphrases of the market, so mixing the two equity curves would leave
@@ -55,7 +57,7 @@ services:
   # binary. A match is priced once, so a cycle that finds nothing new costs one
   # query and no API call.
   priors:
-    image: polytrade-esports-live:0.2.2
+    image: polytrade-esports-live:0.3.0
     command:
       - python
       - -m
@@ -109,7 +111,7 @@ services:
         max-file: "2"
 
   dashboard:
-    image: polytrade-esports-live:0.2.2
+    image: polytrade-esports-live:0.3.0
     command:
       - python
       - -m

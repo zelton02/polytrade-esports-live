@@ -11,10 +11,22 @@ from typing import Any, Dict, List, Optional
 
 from .engine import tick
 from .gamma import GammaClient, is_stale, parse_event
-from .pandascore import PandaScoreClient, PandaScoreError, build_state, team_a_index
+from .pandascore import (
+    SOURCE as PANDASCORE_SOURCE,
+    PandaScoreClient,
+    PandaScoreError,
+    build_state,
+    team_a_index,
+)
 from .paper import PaperConfig
 from .polymarket import PolymarketBookClient
 from .resolver import resolve_known_events, resolve_open_matches
+from .sports_ws import (
+    SOURCE as SPORTS_SOURCE,
+    SPORTS_WS_URL,
+    TERMINAL_SOURCE as SPORTS_TERMINAL_SOURCE,
+    SportsWebSocketAdapter,
+)
 from .storage import Database
 from .timeutil import isoformat, parse_timestamp, utc_now
 from .types import LiveState
@@ -25,6 +37,10 @@ from .types import LiveState
 SEED_PRIOR_A = 0.5
 MAPS_ONLY_NOTICE = (
     "round-level PandaScore data is unavailable; model updates are maps-only"
+)
+ROUND_FEED_NOTICE = (
+    "fresh Sports WebSocket state is unavailable for one or more live matches; "
+    "maps-only fallback is active and new in-play entries are paused"
 )
 
 # Shared across cycles so a refusal is remembered between polls.
@@ -39,6 +55,10 @@ class CollectorConfig:
     max_pages: int = 6
     paper: Optional[PaperConfig] = None
     pandascore_token: str = ""
+    sports_ws_enabled: bool = True
+    sports_ws_url: str = SPORTS_WS_URL
+    sports_max_age_seconds: float = 90.0
+    sports_startup_wait_seconds: float = 5.0
     # Polymarket leaves finished esports events open for days while UMA
     # settles, so an unfiltered sweep accumulates months of dead fixtures.
     max_match_age_hours: float = 12.0
@@ -137,11 +157,20 @@ def _fallback_state(match_id: str, record: Dict[str, Any]) -> LiveState:
     ).normalized()
 
 
+def _has_round_detail(state: LiveState) -> bool:
+    if state.source == SPORTS_SOURCE:
+        return True
+    if state.source == PANDASCORE_SOURCE:
+        return bool((state.raw or {}).get("round_detail_available"))
+    return False
+
+
 def run_cycle(
     database: Database,
     config: Optional[CollectorConfig] = None,
     gamma: Optional[GammaClient] = None,
     books: Optional[PolymarketBookClient] = None,
+    sports: Optional[SportsWebSocketAdapter] = None,
     cycle_index: int = 0,
 ) -> CycleResult:
     global _GAME_DETAIL_GATE
@@ -256,7 +285,7 @@ def run_cycle(
             continue
         try:
             state = _resolve_state(
-                database, panda, live_by_provider, row, record, result, gate
+                database, panda, live_by_provider, row, record, result, gate, sports
             )
             quote = book_client.get_pair(match_id, row["token_a"], row["token_b"])
             # Two ways a match has no view worth trading, and both produce a
@@ -268,13 +297,19 @@ def run_cycle(
             # position. Record both for the board; size neither.
             has_prior = str(row.get("prior_source") or "seed") != "seed"
             fully_grounded = int(row.get("prior_grounded_teams") or 0) >= 2
+            paper_enabled = has_prior and fully_grounded
+            round_feed_ready = not record.get("live") or _has_round_detail(state)
+            if record.get("live") and not round_feed_ready:
+                if ROUND_FEED_NOTICE not in result.notices:
+                    result.notices.append(ROUND_FEED_NOTICE)
             outcome = tick(
                 database=database,
                 state=state,
                 quote=quote,
                 account_name=settings.account_name,
                 paper_config=settings.paper,
-                paper_enabled=has_prior and fully_grounded,
+                paper_enabled=paper_enabled,
+                entry_enabled=paper_enabled and round_feed_ready,
             )
             result.ticked += 1
             result.forecasts.append(
@@ -287,6 +322,8 @@ def run_cycle(
                     "edge_b": outcome["edge_b"],
                     "best_side": outcome["best_side"],
                     "paper_enabled": outcome["paper_enabled"],
+                    "entry_enabled": outcome["entry_enabled"],
+                    "state_source": state.source,
                 }
             )
         except Exception as error:
@@ -308,9 +345,21 @@ def run_cycle(
             result.errors.append("resolution failed: %s" % error)
 
     status = "completed" if not result.errors else ("partial" if result.ticked else "failed")
-    persisted_notices = list(result.notices)
-    if not settings.pandascore_token or not gate.open:
+    if (
+        ROUND_FEED_NOTICE in result.notices
+        and sports is not None
+        and not sports.connected
+        and sports.last_error
+    ):
+        result.notices.append("Sports WebSocket disconnected: %s" % sports.last_error)
+    persisted_notices: List[str] = []
+    if (
+        ROUND_FEED_NOTICE in result.notices
+        and (sports is None or not sports.connected)
+        and (not settings.pandascore_token or not gate.open)
+    ):
         persisted_notices.append(MAPS_ONLY_NOTICE)
+    persisted_notices.extend(result.notices)
     # Preserve order while removing the first-cycle notice duplicate.
     persisted_notices = list(dict.fromkeys(persisted_notices))
     database.finish_collector_run(
@@ -333,9 +382,29 @@ def _resolve_state(
     record: Dict[str, Any],
     result: CycleResult,
     gate: "GameDetailGate",
+    sports: Optional[SportsWebSocketAdapter],
 ) -> LiveState:
     """Prefer real provider state; degrade to map-market state, never to nothing."""
     provider_id = str(row.get("provider_match_id") or "")
+    sports_state: Optional[LiveState] = None
+    if sports is not None and record.get("live") and provider_id:
+        try:
+            sports_state = sports.state_for(
+                provider_match_id=provider_id,
+                match_id=row["match_id"],
+                team_a=row["team_a"],
+                team_b=row["team_b"],
+            )
+            if sports_state is not None and sports_state.source in (
+                SPORTS_SOURCE,
+                SPORTS_TERMINAL_SOURCE,
+            ):
+                return sports_state
+        except ValueError as error:
+            result.notices.append(
+                "%s: Sports WebSocket state rejected: %s"
+                % (row["match_id"], error)
+            )
     match = live_by_provider.get(provider_id)
     if panda is not None and match is not None:
         try:
@@ -365,10 +434,12 @@ def _resolve_state(
                 game_detail=game_detail,
             )
             if state is not None:
-                return state
+                if _has_round_detail(state):
+                    return state
+                return sports_state or state
         except (PandaScoreError, ValueError) as error:
             result.errors.append("%s: pandascore state failed: %s" % (row["match_id"], error))
-    return _fallback_state(row["match_id"], record)
+    return sports_state or _fallback_state(row["match_id"], record)
 
 
 def run_loop(
@@ -379,15 +450,33 @@ def run_loop(
     on_cycle: Optional[Any] = None,
 ) -> None:
     """Run cycles forever (``cycles=0``) or a fixed number, sleeping between."""
+    settings = config or CollectorConfig()
+    sports: Optional[SportsWebSocketAdapter] = None
+    if settings.sports_ws_enabled:
+        sports = SportsWebSocketAdapter(
+            url=settings.sports_ws_url,
+            max_age_seconds=settings.sports_max_age_seconds,
+        )
+        sports.start()
+        sports.wait_ready(settings.sports_startup_wait_seconds)
     completed = 0
-    while cycles <= 0 or completed < cycles:
-        started = time.time()
-        result = run_cycle(database, config, cycle_index=completed)
-        if on_cycle is not None:
-            on_cycle(result)
-        completed += 1
-        if cycles > 0 and completed >= cycles:
-            return
-        elapsed = time.time() - started
-        remaining = max(1.0, float(interval_seconds) - elapsed)
-        time.sleep(remaining)
+    try:
+        while cycles <= 0 or completed < cycles:
+            started = time.time()
+            result = run_cycle(
+                database,
+                settings,
+                sports=sports,
+                cycle_index=completed,
+            )
+            if on_cycle is not None:
+                on_cycle(result)
+            completed += 1
+            if cycles > 0 and completed >= cycles:
+                return
+            elapsed = time.time() - started
+            remaining = max(1.0, float(interval_seconds) - elapsed)
+            time.sleep(remaining)
+    finally:
+        if sports is not None:
+            sports.stop()

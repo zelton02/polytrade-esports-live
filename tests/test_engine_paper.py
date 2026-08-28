@@ -37,6 +37,26 @@ class EnginePaperTests(unittest.TestCase):
         result = tick(self.db, state, quote)
         self.assertEqual(result["paper_actions"], [])
 
+    def test_disabled_entry_still_allows_risk_reducing_exit(self):
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        opening = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        self.assertTrue(tick(self.db, state, opening)["paper_actions"])
+
+        later = "2026-08-27T00:01:00Z"
+        expensive = BookQuote(
+            "m1", 0.75, 0.76, 0.23, 0.24, later, observed_at=later
+        )
+        result = tick(
+            self.db,
+            LiveState("m1", later, 0, 0, 0, 0, observed_at=later),
+            expensive,
+            entry_enabled=False,
+        )
+        self.assertFalse(result["entry_enabled"])
+        self.assertTrue(
+            any(action["action"] == "SELL" for action in result["paper_actions"])
+        )
+
     def test_state_change_can_close_or_flip_position(self):
         opening = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
         first_book = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)

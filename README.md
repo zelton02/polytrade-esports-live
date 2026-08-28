@@ -1,7 +1,8 @@
 # Polytrade Esports Live
 
 An independent, read-only CS2 live probability research project with paper-only
-position management. Runtime dependencies: **Python standard library only**.
+position management. The only runtime package is the pinned WebSocket client
+`websockets==15.0.1`.
 
 The project intentionally does not place real orders, hold wallet keys, or expose
 an authenticated trading path.
@@ -12,10 +13,11 @@ Live board: <https://esports.zhng.tech> (password protected).
 
 ```
 Polymarket Gamma  --discover-->  open CS2 match markets
-                                 teams, Bo, CLOB token ids, pandascoreMatchId
+                                 teams, Bo, CLOB token ids, provider match id
 Hermes / DeepSeek --pre-match--> prior_probability_a + written rationale
-PandaScore        --live----->   maps, rounds, current map, side
-Polymarket CLOB   --book----->   executable bid/ask
+Sports WebSocket --live------>   maps, rounds, current map (joined by gameId)
+PandaScore        --fallback-->  plan-dependent live state
+Polymarket CLOB   --book------>  executable bid/ask
                                           |
                                     engine.tick
                                           |
@@ -40,10 +42,14 @@ sized from it.
   scraping and no API key.
 - Prices upcoming matches with an LLM pre-match prior, under daily and monthly
   cost caps, storing the full rationale and evidence for audit.
-- Reads live series state (maps, rounds, current map) from PandaScore, joined by
-  the `pandascoreMatchId` that Polymarket itself publishes.
+- Reads live series state (maps, rounds, current map) from Polymarket's public
+  Sports WebSocket, joined exactly by its `gameId` and Gamma's
+  `pandascoreMatchId`.
+- Keeps PandaScore as a plan-dependent fallback rather than making a paid token
+  a requirement for round-level updates.
 - Falls back to a maps-only state derived from resolved per-map markets when no
-  live provider is configured.
+  fresh live provider state is available. During a live match that degraded
+  state may reduce existing risk but cannot open or increase a position.
 - Stores executable Polymarket bid/ask snapshots separately from game state.
 - Computes edge against the ask, never against a decorative midpoint.
 - Rebalances a capped paper position with entry/exit hysteresis.
@@ -62,13 +68,20 @@ sized from it.
 |---|---|---|
 | Match discovery, teams, tokens | Polymarket Gamma `/events?tag_slug=esports` | no |
 | Order book (bid/ask) | Polymarket CLOB `/book` | no |
-| Maps won, rounds, current map | PandaScore `/csgo/matches/running` | **yes** (free tier) |
+| Maps won, rounds, current map | Polymarket Sports `wss://sports-api.polymarket.com/ws` | no |
+| Live-state fallback | PandaScore `/csgo/matches/running` | **yes**, detail depends on plan |
 | Maps won (fallback) | resolved per-map Gamma markets | no |
 | Pre-match prior | DeepSeek API (or Hermes CLI) | `DEEPSEEK_API_KEY` |
 
-Polymarket's own `score` field is present on CS2 events but was observed frozen
-at `000-000|0-0|Bo3` on live matches, so it is not used for round state. Its
-`live`, `period` and `ended` flags are used.
+Gamma's HTTP `score` field was observed frozen on live matches, so it is not
+used for round state. The separate Sports WebSocket emits updates shaped like
+`rounds_home-rounds_away|maps_home-maps_away|BoN`; its `gameId` is the same id
+already stored on each discovered fixture. Team names are checked before the
+home/away score is oriented into market outcome A/B order.
+
+The service sometimes emits `000-000` as an explicit unavailable-rounds
+placeholder (a real map-opening score is `0-0`). Those snapshots still improve
+the map score, but remain maps-only and do not unlock new in-play entries.
 
 Set the PandaScore token and confirm what the plan actually exposes:
 
@@ -77,8 +90,12 @@ export PANDASCORE_TOKEN=...
 python3 -m polytrade_esports pandascore-probe
 ```
 
-Without it, the board still runs: matches, market prices, model probability and
-edge are all live; only the in-map round score is missing.
+Without a PandaScore token, the public Sports feed remains the primary live
+source. The adapter is a long-lived background connection, responds to the
+channel's text heartbeat, reconnects with exponential backoff, and rejects a
+cache older than 90 seconds. A disconnect, stale update, missing id, malformed
+score, or team mismatch pauses new in-play entries instead of silently trading
+on a maps-only model.
 
 The dashboard labels this degraded mode `MAPS-ONLY FEED`. In that mode the model
 updates at map boundaries while the Polymarket order book continues to refresh;
@@ -89,7 +106,7 @@ it must not be mistaken for a round-by-round CS2 model.
 Python 3.9+ is enough:
 
 ```bash
-export PYTHONPATH=src
+python3 -m pip install -e .
 python3 -m polytrade_esports init --db data/esports_live.sqlite3
 
 # find every open CS2 match market without writing anything

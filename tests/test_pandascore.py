@@ -42,6 +42,7 @@ class PandaScoreStateTests(unittest.TestCase):
         self.assertEqual((state.rounds_a, state.rounds_b), (9, 6))
         self.assertEqual(state.current_map, "Mirage")
         self.assertEqual(state.source, "pandascore")
+        self.assertTrue(state.raw["round_detail_available"])
 
     def test_sides_swap_when_polymarket_lists_the_other_team_first(self):
         state = build_state("m1", MATCH, team_a_index=1)
@@ -102,6 +103,7 @@ class PandaScoreStateTests(unittest.TestCase):
         self.assertEqual((state.maps_a, state.maps_b), (0, 1))
         self.assertEqual((state.rounds_a, state.rounds_b), (0, 0))
         self.assertEqual(state.current_map, "MAP 2")
+        self.assertFalse(state.raw["round_detail_available"])
 
     def test_map_name_wins_over_position_when_the_plan_provides_it(self):
         match = dict(MATCH)
@@ -118,6 +120,7 @@ class PandaScoreStateTests(unittest.TestCase):
             "teams": [{"team_id": 138974, "score": 7}, {"team_id": 131010, "score": 5}],
         }
         state = build_state("m1", REAL, team_a_index=0, game_detail=detail)
+        self.assertTrue(state.raw["round_detail_available"])
         self.assertEqual(state.current_map, "Ancient")
         self.assertEqual((state.rounds_a, state.rounds_b), (5, 7))
         self.assertEqual((state.maps_a, state.maps_b), (0, 1))

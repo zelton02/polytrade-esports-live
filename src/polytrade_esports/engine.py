@@ -14,6 +14,7 @@ def tick(
     account_name: str = "live-paper",
     paper_config: Optional[PaperConfig] = None,
     paper_enabled: bool = True,
+    entry_enabled: bool = True,
 ) -> Dict[str, Any]:
     """Record one state/book observation, forecast, and optionally rebalance.
 
@@ -70,6 +71,7 @@ def tick(
             quote=normalized_quote,
             config=paper_config,
             market_drift=market_drift,
+            entry_enabled=entry_enabled,
         )
         if paper_enabled
         else []
@@ -87,8 +89,8 @@ def tick(
         "best_side": best_side,
         "paper_actions": actions,
         "paper_enabled": paper_enabled,
+        "entry_enabled": paper_enabled and entry_enabled,
         "market_drift": market_drift,
         "breakdown": breakdown.to_dict(),
         "forecast_at": forecast_at,
     }
-
