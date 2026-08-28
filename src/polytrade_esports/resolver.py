@@ -12,10 +12,11 @@ invert a result and corrupt every score derived from it.
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .gamma import GammaClient, resolution_from_event
+from .gamma import GammaClient, final_map_score, resolution_from_event
 from .paper import settle_match
 from .storage import Database
 from .timeutil import isoformat, parse_timestamp, utc_now
+from .types import LiveState
 
 
 def _age_days(scheduled_at: Optional[str]) -> float:
@@ -49,6 +50,138 @@ class ResolutionResult:
             "errors": self.errors,
             "decided": self.decided,
         }
+
+
+def _record_terminal_state(
+    database: Database, row: Dict[str, Any], event: Dict[str, Any]
+) -> None:
+    """Persist the final map score without manufacturing a terminal forecast."""
+    maps = final_map_score(event, row["team_a"], row["team_b"])
+    if maps is None:
+        return
+
+    try:
+        latest = database.latest_state(row["match_id"])
+    except KeyError:
+        latest = None
+    if (
+        latest is not None
+        and latest.source == "polymarket-gamma-final"
+        and latest.maps_a == maps["maps_a"]
+        and latest.maps_b == maps["maps_b"]
+    ):
+        return
+
+    observed = isoformat(utc_now())
+    database.record_state(
+        LiveState(
+            match_id=row["match_id"],
+            source_at=observed,
+            observed_at=observed,
+            maps_a=maps["maps_a"],
+            maps_b=maps["maps_b"],
+            rounds_a=0,
+            rounds_b=0,
+            current_map="FINAL",
+            source="polymarket-gamma-final",
+            raw={
+                "event_id": event.get("id"),
+                "period": event.get("period"),
+                "score": event.get("score"),
+            },
+        ).normalized()
+    )
+
+
+def _resolve_event(
+    database: Database,
+    row: Dict[str, Any],
+    event: Optional[Dict[str, Any]],
+    account_name: str,
+    result: ResolutionResult,
+) -> None:
+    if event is None:
+        result.pending += 1
+        return
+
+    # Fixture completion and market settlement are separate events. Record the
+    # final maps as soon as Gamma knows them, but never create a forecast from a
+    # terminal snapshot: that would leak the result into the paper strategy.
+    if event.get("ended"):
+        database.update_match_lifecycle(row["match_id"], live=False, ended=True)
+        _record_terminal_state(database, row, event)
+
+    decision = resolution_from_event(event, row["team_a"], row["team_b"])
+    if decision is None:
+        result.pending += 1
+        return
+
+    resolved_at = isoformat(utc_now())
+    if decision.get("void"):
+        database.void_match(row["match_id"], resolved_at)
+        result.voided += 1
+        return
+
+    winner = decision["winner"]
+    database.resolve_match(row["match_id"], winner, resolved_at)
+    result.resolved += 1
+
+    # Positions can only exist where a forecast exists, so a missing forecast
+    # id simply means there is nothing to pay out.
+    try:
+        forecast_id = database.latest_forecast_id(row["match_id"])
+    except (KeyError, ValueError):
+        forecast_id = None
+    if forecast_id is not None:
+        actions = settle_match(
+            database=database,
+            account_name=account_name,
+            match_id=row["match_id"],
+            winner=winner,
+            forecast_id=forecast_id,
+        )
+        result.settled_trades += len(actions)
+
+    result.decided.append(
+        {
+            "match_id": row["match_id"],
+            "team_a": row["team_a"],
+            "team_b": row["team_b"],
+            "winner": winner,
+            "winning_team": row["team_a"] if winner == "A" else row["team_b"],
+        }
+    )
+
+
+def resolve_known_events(
+    database: Database,
+    events: Dict[str, Dict[str, Any]],
+    account_name: str = "live-paper",
+) -> ResolutionResult:
+    """Immediately process ended events already returned by discovery.
+
+    This costs no extra Gamma requests and closes a match in the same collector
+    cycle when the moneyline has already reached an unambiguous 1/0 result.
+    """
+    result = ResolutionResult()
+    if not events:
+        return result
+    database.initialize()
+    rows = {
+        row["match_id"]: row
+        for row in database.open_matches()
+        if row["match_id"] in events
+    }
+    for match_id, event in events.items():
+        row = rows.get(match_id)
+        if row is None:
+            continue
+        result.checked += 1
+        try:
+            _resolve_event(database, row, event, account_name, result)
+        except Exception as error:
+            result.errors.append("%s: %s" % (match_id, error))
+    return result
 
 
 def resolve_open_matches(
@@ -87,55 +220,7 @@ def resolve_open_matches(
                 result.voided += 1
                 result.abandoned += 1
                 continue
-            event = client.get_event(match_id)
-            if event is None:
-                result.pending += 1
-                continue
-            # Fixture completion and market settlement are separate events.
-            # Persist the former even when UMA has not decided the latter yet,
-            # so the dashboard can show AWAITING SETTLEMENT instead of LIVE.
-            if event.get("ended"):
-                database.update_match_lifecycle(match_id, live=False, ended=True)
-            decision = resolution_from_event(event, row["team_a"], row["team_b"])
-            if decision is None:
-                result.pending += 1
-                continue
-
-            resolved_at = isoformat(utc_now())
-            if decision.get("void"):
-                database.void_match(match_id, resolved_at)
-                result.voided += 1
-                continue
-
-            winner = decision["winner"]
-            database.resolve_match(match_id, winner, resolved_at)
-            result.resolved += 1
-
-            # Positions can only exist where a forecast exists, so a missing
-            # forecast id simply means there is nothing to pay out.
-            try:
-                forecast_id = database.latest_forecast_id(match_id)
-            except (KeyError, ValueError):
-                forecast_id = None
-            if forecast_id is not None:
-                actions = settle_match(
-                    database=database,
-                    account_name=account_name,
-                    match_id=match_id,
-                    winner=winner,
-                    forecast_id=forecast_id,
-                )
-                result.settled_trades += len(actions)
-
-            result.decided.append(
-                {
-                    "match_id": match_id,
-                    "team_a": row["team_a"],
-                    "team_b": row["team_b"],
-                    "winner": winner,
-                    "winning_team": row["team_a"] if winner == "A" else row["team_b"],
-                }
-            )
+            _resolve_event(database, row, client.get_event(match_id), account_name, result)
         except Exception as error:
             result.errors.append("%s: %s" % (match_id, error))
 

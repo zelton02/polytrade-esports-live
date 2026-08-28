@@ -154,6 +154,40 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["live"], 0)
         self.assertEqual(payload["counts"]["pending"], 1)
 
+    def test_settled_event_records_final_maps_and_resolves_immediately(self):
+        running = live_event()
+        run_cycle(self.db, self.config, gamma=FakeGamma([running]), books=FakeBooks())
+
+        finished = copy.deepcopy(running)
+        finished["live"] = False
+        finished["ended"] = True
+        finished["score"] = "000-000|2-0|Bo3"
+        for market in finished["markets"]:
+            if market.get("groupItemTitle") in ("Map 1 Winner", "Map 2 Winner"):
+                market["closed"] = True
+                market["outcomePrices"] = json.dumps(["1", "0"])
+            if market.get("sportsMarketType") == "moneyline":
+                market["closed"] = True
+                market["outcomePrices"] = json.dumps(["1", "0"])
+
+        result = run_cycle(
+            self.db,
+            self.config,
+            gamma=FakeGamma([finished]),
+            books=FakeBooks(),
+            cycle_index=1,
+        )
+
+        row = self.db.dashboard_payload()["matches"][0]
+        self.assertEqual(result.resolved, 1)
+        self.assertEqual((row["status"], row["winner"]), ("resolved", "A"))
+        self.assertEqual((row["maps_a"], row["maps_b"]), (2, 0))
+        self.assertEqual(row["current_map"], "FINAL")
+        state = self.db.latest_state(FIXTURE["slug"])
+        self.assertEqual(state.source, "polymarket-gamma-final")
+        detail = self.db.match_detail(FIXTURE["slug"])
+        self.assertEqual((detail["latest"]["maps_a"], detail["latest"]["maps_b"]), (2, 0))
+
     def test_live_match_missing_from_discovery_is_reconciled_by_slug(self):
         running = live_event()
         run_cycle(self.db, self.config, gamma=FakeGamma([running]), books=FakeBooks())

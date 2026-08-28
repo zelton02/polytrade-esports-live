@@ -5,6 +5,7 @@ from pathlib import Path
 
 from polytrade_esports.gamma import (
     best_of,
+    final_map_score,
     map_score_from_markets,
     parse_event,
     series_market,
@@ -84,6 +85,36 @@ class GammaParsingTests(unittest.TestCase):
         self.assertEqual(
             map_score_from_markets(self.event, "Lavked", "Esport Academy Copenhagen"),
             {"maps_a": 0, "maps_b": 0},
+        )
+
+    def test_final_score_prefers_resolved_map_markets(self):
+        self.event["ended"] = True
+        self.event["score"] = "000-000|0-2|Bo3"
+        for market in self.event["markets"]:
+            if market.get("groupItemTitle") in ("Map 1 Winner", "Map 2 Winner"):
+                market["closed"] = True
+                market["outcomePrices"] = json.dumps(["1", "0"])
+        self.assertEqual(
+            final_map_score(self.event, "Lavked", "Esport Academy Copenhagen"),
+            {"maps_a": 2, "maps_b": 0},
+        )
+
+    def test_final_score_falls_back_to_validated_gamma_score(self):
+        self.event["ended"] = True
+        self.event["score"] = "000-000|2-0|Bo3"
+        self.assertEqual(
+            final_map_score(self.event, "Lavked", "Esport Academy Copenhagen"),
+            {"maps_a": 2, "maps_b": 0},
+        )
+
+    def test_final_score_refuses_an_unfinished_or_partial_series(self):
+        self.event["score"] = "000-000|1-0|Bo3"
+        self.assertIsNone(
+            final_map_score(self.event, "Lavked", "Esport Academy Copenhagen")
+        )
+        self.event["ended"] = True
+        self.assertIsNone(
+            final_map_score(self.event, "Lavked", "Esport Academy Copenhagen")
         )
 
     def test_to_match_validates(self):

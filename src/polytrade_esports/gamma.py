@@ -8,6 +8,7 @@ except as a fallback signal for the map score.
 """
 
 import json
+import re
 from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -206,6 +207,38 @@ def map_score_from_markets(
             elif str(outcome).strip() == team_b:
                 maps_b += 1
     return {"maps_a": maps_a, "maps_b": maps_b}
+
+
+def final_map_score(
+    event: Dict[str, Any], team_a: str, team_b: str
+) -> Optional[Dict[str, int]]:
+    """Return a validated terminal series score for an ended fixture.
+
+    Resolved per-map markets are the preferred source. Gamma's compact score
+    field is a fallback for the short interval where the series result has
+    landed but one of the child markets has not been exposed as resolved yet.
+    A score is accepted only when one side has reached the number of maps
+    required to win the advertised best-of series.
+    """
+    if not event.get("ended"):
+        return None
+
+    series_length = best_of(event)
+    needed = series_length // 2 + 1
+
+    maps = map_score_from_markets(event, team_a, team_b)
+    maps_a, maps_b = int(maps["maps_a"]), int(maps["maps_b"])
+    if max(maps_a, maps_b) == needed and maps_a + maps_b <= series_length:
+        return maps
+
+    # Typical Gamma value: "000-000|2-0|Bo3". Select only a pair that can be
+    # the completed series score, which rejects the leading round/placeholder
+    # segment and avoids treating an in-map score as a final result.
+    for left, right in re.findall(r"(?<!\d)(\d+)-(\d+)(?!\d)", str(event.get("score") or "")):
+        score_a, score_b = int(left), int(right)
+        if max(score_a, score_b) == needed and score_a + score_b <= series_length:
+            return {"maps_a": score_a, "maps_b": score_b}
+    return None
 
 
 def to_match(record: Dict[str, Any], prior_probability_a: float) -> Match:

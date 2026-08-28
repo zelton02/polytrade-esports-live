@@ -147,6 +147,11 @@ the scored cohort.
 Fixture state follows `scheduled -> live -> finished_pending -> resolved|void`.
 `finished_pending` is displayed as `AWAITING SETTLEMENT`; it is no longer live,
 but it remains visible and unscored until the market has a final decision.
+When Gamma reports a completed series, the collector writes a separate
+`polymarket-gamma-final` map snapshot and never feeds that terminal observation
+back into the forecast or paper engine. If the match-winner market is already
+decided at 1/0, settlement happens in the same collection cycle; confirmed-ended
+fixtures also bypass the generic five-hour polling gate.
 
 ```bash
 python3 -m polytrade_esports resolve-open --db data/esports_live.sqlite3

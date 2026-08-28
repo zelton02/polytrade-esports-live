@@ -949,10 +949,12 @@ class Database:
     def matches_awaiting_resolution(
         self, min_age_hours: float = 1.0, limit: int = 100
     ) -> List[Dict[str, Any]]:
-        """Open matches whose scheduled start is far enough in the past.
+        """Open matches that are finished or whose start is far in the past.
 
         Ordered oldest first so a long backlog drains deterministically rather
-        than re-checking the same recent fixtures every cycle.
+        than re-checking the same recent fixtures every cycle. Confirmed-ended
+        fixtures bypass the age gate: the gate exists to avoid polling every
+        merely-started match, not to delay a result Gamma already knows.
         """
         cutoff = isoformat(utc_now() - timedelta(hours=float(min_age_hours)))
         with self.connect() as connection:
@@ -960,8 +962,10 @@ class Database:
                 """
                 SELECT * FROM matches
                 WHERE status='open'
-                  AND scheduled_at IS NOT NULL
-                  AND scheduled_at < ?
+                  AND (
+                    ended=1
+                    OR (scheduled_at IS NOT NULL AND scheduled_at < ?)
+                  )
                 -- Confirmed-finished fixtures must not sit behind an old
                 -- unsettled backlog. Current ended matches settle first.
                 ORDER BY ended DESC, scheduled_at DESC
@@ -1070,7 +1074,11 @@ class Database:
                     WHERE f2.match_id=m.match_id
                     ORDER BY f2.forecast_at DESC, f2.forecast_id DESC LIMIT 1
                 )
-                LEFT JOIN state_snapshots s ON s.state_id=f.state_id
+                LEFT JOIN state_snapshots s ON s.state_id = (
+                    SELECT s2.state_id FROM state_snapshots s2
+                    WHERE s2.match_id=m.match_id
+                    ORDER BY s2.source_at DESC, s2.state_id DESC LIMIT 1
+                )
                 LEFT JOIN market_snapshots b ON b.book_id=f.book_id
                 LEFT JOIN llm_priors p ON p.prior_id = (
                     SELECT p2.prior_id FROM llm_priors p2
@@ -1138,6 +1146,17 @@ class Database:
             ).fetchall()
             detail["history"] = [dict(item) for item in history]
 
+            latest_state = connection.execute(
+                """
+                SELECT maps_a, maps_b, rounds_a, rounds_b, current_map,
+                       source AS state_source, source_at AS state_source_at
+                FROM state_snapshots
+                WHERE match_id=?
+                ORDER BY source_at DESC, state_id DESC LIMIT 1
+                """,
+                (match_id,),
+            ).fetchone()
+
             account = connection.execute(
                 "SELECT account_id FROM paper_accounts WHERE name=?", (account_name,)
             ).fetchone()
@@ -1176,7 +1195,11 @@ class Database:
                 match_id, prior["created_at"]
             )
         detail["prior"] = prior
-        latest = detail["history"][-1] if detail["history"] else None
+        latest = dict(detail["history"][-1]) if detail["history"] else {}
+        if latest_state is not None:
+            latest.update(dict(latest_state))
+        if not latest:
+            latest = None
         detail["latest"] = latest
         detail["generated_at"] = isoformat(utc_now())
         return detail

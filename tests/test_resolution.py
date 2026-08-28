@@ -154,6 +154,27 @@ class ResolverTests(unittest.TestCase):
         second = resolve_open_matches(self.db, gamma=gamma)
         self.assertEqual(second.checked, 0, "a settled match must leave the queue")
 
+    def test_confirmed_ended_match_bypasses_the_five_hour_gate(self):
+        match_id = "cs2-young-finished-2026-08-29"
+        self.db.add_match(
+            Match(
+                match_id,
+                "Lavked",
+                "Esport Academy Copenhagen",
+                3,
+                0.5,
+                scheduled_at=isoformat(utc_now()),
+            )
+        )
+        self.db.update_match_lifecycle(match_id, live=False, ended=True)
+        result = resolve_open_matches(
+            self.db,
+            gamma=FakeGamma({match_id: settled(0)}),
+            min_age_hours=5.0,
+        )
+        self.assertEqual(result.resolved, 1)
+        self.assertEqual(self.db.match_detail(match_id)["winner"], "A")
+
     def test_undecided_match_stays_pending(self):
         gamma = FakeGamma({"cs2-lavked-eac-2026-08-29": settled(0, ended=False)})
         result = resolve_open_matches(self.db, gamma=gamma)

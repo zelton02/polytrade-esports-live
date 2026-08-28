@@ -14,7 +14,7 @@ from .gamma import GammaClient, is_stale, parse_event
 from .pandascore import PandaScoreClient, PandaScoreError, build_state, team_a_index
 from .paper import PaperConfig
 from .polymarket import PolymarketBookClient
-from .resolver import resolve_open_matches
+from .resolver import resolve_known_events, resolve_open_matches
 from .storage import Database
 from .timeutil import isoformat, parse_timestamp, utc_now
 from .types import LiveState
@@ -157,12 +157,15 @@ def run_cycle(
     run_id = database.start_collector_run()
 
     records: Dict[str, Dict[str, Any]] = {}
+    ended_events: Dict[str, Dict[str, Any]] = {}
     try:
         for event in gamma_client.cs2_events(max_pages=settings.max_pages):
             record = parse_event(event)
             if record is None or not record["match_id"]:
                 continue
             records[record["match_id"]] = record
+            if record.get("ended"):
+                ended_events[record["match_id"]] = event
             if is_stale(record, settings.max_match_age_hours):
                 # Terminal events are excluded from discovery, but their state
                 # must still be persisted. Otherwise a row that was once live
@@ -199,6 +202,8 @@ def run_cycle(
             if record is None:
                 continue
             records[match_id] = record
+            if record.get("ended"):
+                ended_events[match_id] = event
             became_finished = database.update_match_lifecycle(
                 match_id, live=bool(record.get("live")), ended=bool(record.get("ended"))
             )
@@ -206,6 +211,20 @@ def run_cycle(
                 result.finished += 1
         except Exception as error:
             result.notices.append("%s: lifecycle refresh unavailable: %s" % (match_id, error))
+
+    # An ended event already returned by discovery can be finalized without a
+    # second request. This also records a terminal map snapshot, but never runs
+    # the forecast/paper engine on information observed after the result.
+    try:
+        immediate = resolve_known_events(
+            database=database,
+            events=ended_events,
+            account_name=settings.account_name,
+        )
+        result.resolved += immediate.resolved + immediate.voided
+        result.errors.extend(immediate.errors[:5])
+    except Exception as error:
+        result.errors.append("immediate resolution failed: %s" % error)
 
     live_by_provider: Dict[str, Dict[str, Any]] = {}
     panda: Optional[PandaScoreClient] = None
@@ -277,7 +296,7 @@ def run_cycle(
                 gamma=gamma_client,
                 account_name=settings.account_name,
             )
-            result.resolved = settlement.resolved + settlement.voided
+            result.resolved += settlement.resolved + settlement.voided
             result.errors.extend(settlement.errors[:5])
         except Exception as error:
             result.errors.append("resolution failed: %s" % error)
