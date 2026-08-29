@@ -195,7 +195,7 @@ function renderAi(detail) {
   }
   host.appendChild(
     kv([
-      ["PROBABILITY", pct(prior.probability_a) + " " + detail.team_a],
+      ["PRE-MATCH WIN PROBABILITY", pct(prior.probability_a) + " " + detail.team_a],
       ["CONFIDENCE", String(prior.confidence || "").toUpperCase()],
       ["MARKET THEN", prior.market_probability_a === null || prior.market_probability_a === undefined
         ? "not recorded — this match cannot be scored"
