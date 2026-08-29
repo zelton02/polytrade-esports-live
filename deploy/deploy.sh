@@ -22,21 +22,38 @@ echo "recreating containers"
 docker compose up -d --force-recreate
 
 echo "waiting for the dashboard"
+READY=0
 for _ in $(seq 1 30); do
-    if curl -fsS -o /dev/null "http://127.0.0.1:8788/healthz"; then break; fi
+    if curl -fsS -o /dev/null "http://127.0.0.1:8788/healthz"; then
+        READY=1
+        break
+    fi
     sleep 2
 done
+if [ "$READY" -ne 1 ]; then
+    echo "DEPLOY FAILED: dashboard health check did not become ready" >&2
+    exit 1
+fi
 
-# The served bytes are the only proof that matters; the image can be correct
-# while a stale container is still bound to the port.
-# The credential goes in on stdin as a curl config file rather than on the
-# command line, where it would be readable in `ps` by any user on the host.
-SERVED_SHA="$(printf 'user = "%s"\n' "${DASH_AUTH:-}" \
-    | curl -fsS -K - http://127.0.0.1:8788/app.css | sha256sum | cut -c1-12)"
+# Production stores only the dashboard password hash, not a plaintext Basic
+# Auth credential. Verify the file inside the running container and prove the
+# bound HTTP port is both healthy and protected.
+DASHBOARD_ID="$(docker compose ps -q dashboard)"
+if [ -z "$DASHBOARD_ID" ]; then
+    echo "DEPLOY FAILED: dashboard container is missing" >&2
+    exit 1
+fi
+CONTAINER_SHA="$(docker exec "$DASHBOARD_ID" \
+    sha256sum /app/src/polytrade_esports/web/app.css | cut -c1-12)"
 LOCAL_SHA="$(sha256sum src/polytrade_esports/web/app.css | cut -c1-12)"
-echo "served app.css $SERVED_SHA  local $LOCAL_SHA"
-if [ "$SERVED_SHA" != "$LOCAL_SHA" ]; then
+echo "container app.css $CONTAINER_SHA  local $LOCAL_SHA"
+if [ "$CONTAINER_SHA" != "$LOCAL_SHA" ]; then
     echo "DEPLOY FAILED: the container is not serving the current app.css" >&2
+    exit 1
+fi
+ROOT_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8788/)"
+if [ "$ROOT_STATUS" != "401" ]; then
+    echo "DEPLOY FAILED: dashboard root returned $ROOT_STATUS instead of 401" >&2
     exit 1
 fi
 docker compose ps --format "table {{.Name}}\t{{.Status}}"
