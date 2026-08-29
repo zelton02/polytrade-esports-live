@@ -709,8 +709,42 @@ class Database:
         if old.match_id != new.match_id:
             raise ValueError("rejected states must reference one match")
         payload = new.to_dict()
-        digest = _sha(payload)
+        # Fingerprint the transition content rather than its timestamps/raw
+        # envelope. A stale Gamma fallback can repeat the same 0-0 regression
+        # every minute; the cycle counter should keep reporting that, but the
+        # audit table only needs one row until either side's trusted state moves.
+        digest = _sha(
+            {
+                "reason": str(reason),
+                "previous": {
+                    "maps_a": old.maps_a,
+                    "maps_b": old.maps_b,
+                    "rounds_a": old.rounds_a,
+                    "rounds_b": old.rounds_b,
+                    "current_map": old.current_map,
+                    "source": old.source,
+                },
+                "candidate": {
+                    "maps_a": new.maps_a,
+                    "maps_b": new.maps_b,
+                    "rounds_a": new.rounds_a,
+                    "rounds_b": new.rounds_b,
+                    "current_map": new.current_map,
+                    "source": new.source,
+                },
+            }
+        )
         with self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT rejection_id FROM state_rejections
+                WHERE match_id=? AND reason=? AND payload_sha256=?
+                ORDER BY rejection_id DESC LIMIT 1
+                """,
+                (new.match_id, str(reason), digest),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["rejection_id"])
             connection.execute(
                 """
                 INSERT OR IGNORE INTO state_rejections(

@@ -43,8 +43,14 @@ class StorageTests(unittest.TestCase):
             "m1", "2026-08-27T00:00:05Z", 0, 0, 8, 5,
             observed_at="2026-08-27T00:00:05Z", source="sports",
         )
+        repeated = LiveState(
+            "m1", "2026-08-27T00:01:05Z", 0, 0, 8, 5,
+            observed_at="2026-08-27T00:01:05Z", source="sports",
+        )
         first = self.db.record_state_rejection(old, new, "same_map_round_score_regressed")
-        second = self.db.record_state_rejection(old, new, "same_map_round_score_regressed")
+        second = self.db.record_state_rejection(
+            old, repeated, "same_map_round_score_regressed"
+        )
         report = self.db.state_rejection_summary()
         self.assertEqual(first, second)
         self.assertEqual(report["total"], 1)
