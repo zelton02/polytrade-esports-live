@@ -20,6 +20,11 @@ WORKDIR /app
 ARG SOURCE_SHA=unknown
 RUN printf '%s\n' "$SOURCE_SHA" > /app/.source-sha
 
+# The source hash proves byte-for-byte freshness; the Git SHA ties that source
+# directly to the Actions run that deployed it.
+ARG GIT_SHA=unknown
+RUN printf '%s\n' "$GIT_SHA" > /app/.git-sha
+
 COPY --chown=collector:collector src /app/src
 
 USER collector

@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from .storage import Database
 
 WEB_ROOT = Path(__file__).with_name("web")
+DEPLOYMENT_ASSETS = ("index.html", "app.js", "app.css", "detail.html", "detail.js")
 # Match ids are Polymarket event slugs. Anything outside this shape is not a
 # slug we ever issued, so it is refused before it reaches a query.
 SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
@@ -33,6 +34,14 @@ STATIC_TYPES = {
     ".png": "image/png",
     ".ico": "image/x-icon",
 }
+
+
+def deployment_asset_manifest() -> Dict[str, str]:
+    """Hashes used to prove the public tunnel reached the current container."""
+    return {
+        name: hashlib.sha256((WEB_ROOT / name).read_bytes()).hexdigest()
+        for name in DEPLOYMENT_ASSETS
+    }
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -136,6 +145,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             body = b"ok\n"
             self._headers(HTTPStatus.OK, "text/plain; charset=utf-8", len(body))
             self.wfile.write(body)
+            return
+        if path == "/healthz/assets":
+            # The dashboard is intentionally password protected, so CI cannot
+            # download the five assets themselves. Publishing only their
+            # hashes gives the deployment an end-to-end freshness proof
+            # through Cloudflare without weakening authentication.
+            self._json({"status": "ok", "assets": deployment_asset_manifest()})
             return
         if not self._authorized():
             self._unauthorized()

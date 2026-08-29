@@ -9,7 +9,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from polytrade_esports.dashboard import DashboardServer
+from polytrade_esports.dashboard import (
+    DEPLOYMENT_ASSETS,
+    DashboardServer,
+    deployment_asset_manifest,
+)
 from polytrade_esports.storage import Database
 from polytrade_esports.types import Match
 
@@ -130,6 +134,15 @@ class DashboardAuthTests(unittest.TestCase):
 
     def test_healthz_stays_open_for_container_probes(self):
         self.assertEqual(self._get("/healthz").status, 200)
+
+    def test_asset_health_manifest_is_public_but_contains_only_hashes(self):
+        response = self._get("/healthz/assets")
+        payload = json.loads(response.read().decode())
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload, {"status": "ok", "assets": deployment_asset_manifest()})
+        self.assertEqual(set(payload["assets"]), set(DEPLOYMENT_ASSETS))
+        for digest in payload["assets"].values():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
     def test_index_and_assets_are_served_with_a_strict_policy(self):
         for path, expected in (

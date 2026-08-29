@@ -1,11 +1,20 @@
-name: test
+name: test-and-deploy
+
 on:
   push:
+    branches:
+      - main
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   unittest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.12"]
     steps:
@@ -13,15 +22,178 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Python unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
 
   dashboard-render:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: node tests/js/render_test.js
-      - run: node tests/js/detail_test.js
+      - name: Overview JavaScript tests
+        run: node tests/js/render_test.js
+      - name: Detail JavaScript tests
+        run: node tests/js/detail_test.js
 
+  deployment-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Check deployment shell
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck deploy/deploy.sh
+          fi
+      - name: Parse GitHub Actions YAML
+        run: ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/test.yml")'
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - unittest
+      - dashboard-render
+      - deployment-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: polytrade-esports-production
+      cancel-in-progress: false
+    env:
+      PROD_ROOT: /opt/polytrade-esports-live
+      PUBLIC_BASE_URL: https://esports.zhng.tech
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required production secrets
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+        run: |
+          for name in PROD_SSH_HOST PROD_SSH_USER PROD_SSH_PRIVATE_KEY PROD_SSH_KNOWN_HOSTS; do
+            if [ -z "${!name:-}" ]; then
+              echo "DEPLOY FAILED: required GitHub Actions secret $name is not configured" >&2
+              exit 1
+            fi
+          done
+          if ! printf '%s\n' "$PROD_SSH_HOST" | grep -Eq '^[A-Za-z0-9.-]+$'; then
+            echo "DEPLOY FAILED: PROD_SSH_HOST is not a hostname or IPv4 address" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$PROD_SSH_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_-]*$'; then
+            echo "DEPLOY FAILED: PROD_SSH_USER is not a safe SSH username" >&2
+            exit 1
+          fi
+
+      - name: Configure pinned production SSH host key
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          PROD_SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$PROD_SSH_PRIVATE_KEY" | tr -d '\r' > "$HOME/.ssh/prod_key"
+          chmod 600 "$HOME/.ssh/prod_key"
+          printf '%s\n' "$PROD_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/prod_key" >/dev/null
+          ssh-keygen -l -f "$HOME/.ssh/known_hosts" >/dev/null
+          ssh-keygen -F "$PROD_SSH_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null
+          {
+            echo "Host production"
+            echo "  HostName $PROD_SSH_HOST"
+            echo "  User $PROD_SSH_USER"
+            echo "  IdentityFile $HOME/.ssh/prod_key"
+            echo "  IdentitiesOnly yes"
+            echo "  UserKnownHostsFile $HOME/.ssh/known_hosts"
+            echo "  StrictHostKeyChecking yes"
+            echo "  BatchMode yes"
+          } > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+          ssh production true
+
+      - name: Back up production SQLite before code sync
+        id: backup
+        run: |
+          backup_output="$(
+            ssh production \
+              "cd '$PROD_ROOT' && PROJECT_ROOT='$PROD_ROOT' bash -s -- --backup-only" \
+              < deploy/deploy.sh
+          )"
+          printf '%s\n' "$backup_output"
+          backup_path="$(printf '%s\n' "$backup_output" | sed -n 's/^PRE_DEPLOY_BACKUP=//p' | tail -n 1)"
+          if ! printf '%s\n' "$backup_path" | grep -Eq \
+            '^/opt/polytrade-esports-live/data/backups/esports_live\.[0-9]{8}T[0-9]{6}Z\.pre-deploy\.sqlite3$'; then
+            echo "DEPLOY FAILED: backup step did not return a valid production backup path" >&2
+            exit 1
+          fi
+          echo "path=$backup_path" >> "$GITHUB_OUTPUT"
+
+      - name: Safely synchronize production source
+        run: |
+          rsync -az --itemize-changes \
+            --exclude='/.git/' \
+            --exclude='/.env' \
+            --exclude='/data/' \
+            --exclude='/.DS_Store' \
+            --exclude='*.sqlite3' \
+            --exclude='*.sqlite3-*' \
+            --exclude='backups/' \
+            ./ "production:$PROD_ROOT/"
+
+      - name: Deploy and verify production
+        env:
+          BACKUP_PATH: ${{ steps.backup.outputs.path }}
+        run: |
+          ssh production \
+            "cd '$PROD_ROOT' && DEPLOY_GIT_SHA='$GITHUB_SHA' PUBLIC_BASE_URL='$PUBLIC_BASE_URL' bash deploy/deploy.sh --pre-deploy-backup '$BACKUP_PATH'"
+
+      - name: Verify the public tunnel independently
+        run: |
+          health="$(curl --retry 5 --retry-all-errors --retry-delay 2 -fsS "$PUBLIC_BASE_URL/healthz")"
+          [ "$health" = "ok" ] || {
+            echo "DEPLOY FAILED: public health check returned: $health" >&2
+            exit 1
+          }
+          curl --retry 5 --retry-all-errors --retry-delay 2 -fsS \
+            "$PUBLIC_BASE_URL/healthz/assets" > /tmp/production-assets.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          names = ("index.html", "app.js", "app.css", "detail.html", "detail.js")
+          root = Path("src/polytrade_esports/web")
+          expected = {
+              name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+              for name in names
+          }
+          actual = json.loads(Path("/tmp/production-assets.json").read_text())
+          if actual != {"status": "ok", "assets": expected}:
+              raise SystemExit("DEPLOY FAILED: public assets do not match this GitHub commit")
+          PY
+          root_status="$(curl -sS -o /dev/null -w '%{http_code}' "$PUBLIC_BASE_URL/")"
+          [ "$root_status" = "401" ] || {
+            echo "DEPLOY FAILED: public dashboard authentication returned $root_status" >&2
+            exit 1
+          }
+
+      - name: Write deployment receipt
+        env:
+          BACKUP_PATH: ${{ steps.backup.outputs.path }}
+        run: |
+          {
+            echo "### Production deployment verified"
+            echo "- Git commit: \`$GITHUB_SHA\`"
+            echo "- Pre-deploy backup: \`$BACKUP_PATH\`"
+            echo "- Public health: \`ok\`"
+            echo "- Public assets: all five SHA-256 hashes match"
+          } >> "$GITHUB_STEP_SUMMARY"
