@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: polytrade-esports-live:0.3.0
+    image: polytrade-esports-live:0.4.0
     command:
       - python
       - -m
@@ -58,7 +58,7 @@ services:
   # binary. A match is priced once, so a cycle that finds nothing new costs one
   # query and no API call.
   priors:
-    image: polytrade-esports-live:0.3.0
+    image: polytrade-esports-live:0.4.0
     command:
       - python
       - -m
@@ -112,7 +112,7 @@ services:
         max-file: "2"
 
   dashboard:
-    image: polytrade-esports-live:0.3.0
+    image: polytrade-esports-live:0.4.0
     command:
       - python
       - -m

@@ -16,7 +16,7 @@ Polymarket Gamma  --discover-->  open CS2 match markets
                                  teams, Bo, CLOB token ids, provider match id
 Hermes / DeepSeek --pre-match--> prior_probability_a + written rationale
 Sports WebSocket --live------>   maps, rounds, current map (joined by gameId)
-PandaScore        --fallback-->  plan-dependent live state
+Canonical guard  --validate-->  monotonic map/round state, freeze on degradation
 Polymarket CLOB   --book------>  executable bid/ask
                                           |
                                     engine.tick
@@ -45,11 +45,14 @@ sized from it.
 - Reads live series state (maps, rounds, current map) from Polymarket's public
   Sports WebSocket, joined exactly by its `gameId` and Gamma's
   `pandascoreMatchId`.
-- Keeps PandaScore as a plan-dependent fallback rather than making a paid token
-  a requirement for round-level updates.
+- Keeps PandaScore code available as an explicit opt-in fallback, disabled by
+  default in production.
 - Falls back to a maps-only state derived from resolved per-map markets when no
   fresh live provider state is available. During a live match that degraded
-  state may reduce existing risk but cannot open or increase a position.
+  state preserves the last trusted rounds for forecasting, may reduce existing
+  risk, and cannot open or increase a position.
+- Rejects map-score and same-map round-score regressions, freezes the last
+  trusted state, and stores the rejected candidate and reason for audit.
 - Stores executable Polymarket bid/ask snapshots separately from game state.
 - Computes edge against the ask, never against a decorative midpoint.
 - Rebalances a capped paper position with entry/exit hysteresis.
@@ -60,6 +63,10 @@ sized from it.
   moves to `AWAITING SETTLEMENT` immediately instead of remaining `LIVE` until
   Polymarket resolves it.
 - Serves a live dashboard with basic auth and a strict CSP.
+- Reports Sports WebSocket connection, message age, round coverage,
+  placeholders, frozen states, and rejected transitions on the dashboard.
+- Attributes every forecast and paper trade to exactly one horizon:
+  `pre-match`, `map-boundary`, or `round-live`, with separate PnL summaries.
 - Rejects future-dated source observations to reduce leakage risk.
 
 ## Live data sources
@@ -100,9 +107,11 @@ cache older than 90 seconds. A disconnect, stale update, missing id, malformed
 score, or team mismatch pauses new in-play entries instead of silently trading
 on a maps-only model.
 
-The dashboard labels this degraded mode `MAPS-ONLY FEED`. In that mode the model
-updates at map boundaries while the Polymarket order book continues to refresh;
-it must not be mistaken for a round-by-round CS2 model.
+The dashboard labels degraded modes explicitly and shows their cycle counts. A
+same-map `000-000`, disconnect, or stale update keeps the last trusted rounds on
+the model curve instead of snapping it back to zero, while entry remains paused.
+At a genuine map-score increment the guard accepts the new map and permits the
+round score to reset.
 
 ## Quick start
 
@@ -191,6 +200,28 @@ was written that way first, and only the tests caught it.
 This guard is a mitigation for missing round data, not a substitute for it.
 With a live round feed the model would move when the market moves, and the
 question would not arise.
+
+## Canonical state and strategy attribution
+
+The latest provider payload is a candidate, not automatically truth. The
+canonical transition guard requires map scores to be non-decreasing and round
+scores to be non-decreasing within one map. A map-score increment (or a later
+explicit map period) is the only transition that permits rounds to reset.
+Rejected payloads are written to `state_rejections`; degraded-but-valid
+maps-only payloads freeze the previous rounds without being labelled provider
+corruption.
+
+Strategy labels describe the information horizon used for each decision:
+
+| Label | Meaning |
+|---|---|
+| `pre-match` | Match has not started; only the frozen prior and current book are available |
+| `map-boundary` | Live decision from a completed-map transition or maps-only feed |
+| `round-live` | Live decision from an accepted round-level snapshot |
+
+Paper positions keep their opening strategy even if a later horizon reduces or
+settles them. The dashboard reports decisions and trades by decision horizon,
+while realized/open PnL is attributed to the strategy that opened the exposure.
 
 ## Known follow-ups
 

@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from .timeutil import canonical_timestamp, isoformat, parse_timestamp, utc_now
 from .types import BookQuote, LiveState, Match
+from .state_guard import STRATEGIES, validate_strategy
 
 
 SCHEMA = """
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS forecasts (
     edge_a REAL NOT NULL,
     edge_b REAL NOT NULL,
     best_side TEXT CHECK (best_side IN ('A', 'B') OR best_side IS NULL),
+    strategy TEXT NOT NULL DEFAULT 'pre-match',
     breakdown_json TEXT NOT NULL,
     UNIQUE (state_id, book_id, model_version)
 );
@@ -115,6 +117,7 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     shares REAL NOT NULL DEFAULT 0,
     avg_cost REAL NOT NULL DEFAULT 0,
     realized_pnl REAL NOT NULL DEFAULT 0,
+    entry_strategy TEXT NOT NULL DEFAULT 'pre-match',
     updated_at TEXT NOT NULL,
     PRIMARY KEY (account_id, match_id, outcome)
 );
@@ -130,12 +133,31 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     price REAL NOT NULL,
     cash_delta REAL NOT NULL,
     realized_pnl REAL NOT NULL DEFAULT 0,
+    decision_strategy TEXT NOT NULL DEFAULT 'pre-match',
+    entry_strategy TEXT NOT NULL DEFAULT 'pre-match',
     reason TEXT NOT NULL,
     traded_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_trade_account_time
 ON paper_trades(account_id, traded_at);
+
+CREATE TABLE IF NOT EXISTS state_rejections (
+    rejection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id TEXT NOT NULL REFERENCES matches(match_id),
+    source TEXT NOT NULL,
+    source_at TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    previous_json TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    rejected_at TEXT NOT NULL,
+    UNIQUE(match_id, source, source_at, reason, payload_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_rejection_match_time
+ON state_rejections(match_id, rejected_at);
 """
 
 # Schema additions for live discovery and LLM priors. Kept separate from SCHEMA
@@ -214,6 +236,20 @@ COLLECTOR_COLUMNS = (
     # maps-only feed look like a round-level feed. Keep them with every run so
     # the dashboard can state the effective capability honestly.
     ("notices_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("feed_status_json", "TEXT NOT NULL DEFAULT '{}'"),
+)
+
+FORECAST_COLUMNS = (
+    ("strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
+)
+
+POSITION_COLUMNS = (
+    ("entry_strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
+)
+
+TRADE_COLUMNS = (
+    ("decision_strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
+    ("entry_strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
 )
 
 # Esports start times slip routinely; a prior written just after the scheduled
@@ -285,9 +321,16 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             connection.executescript(SCHEMA_V2)
+            version_row = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            previous_version = int(version_row["value"]) if version_row else 0
             self._migrate_columns(connection, "matches", MATCH_COLUMNS)
             self._migrate_columns(connection, "llm_priors", PRIOR_COLUMNS)
             self._migrate_columns(connection, "collector_runs", COLLECTOR_COLUMNS)
+            self._migrate_columns(connection, "forecasts", FORECAST_COLUMNS)
+            self._migrate_columns(connection, "paper_positions", POSITION_COLUMNS)
+            self._migrate_columns(connection, "paper_trades", TRADE_COLUMNS)
             connection.execute(
                 """
                 UPDATE matches
@@ -306,10 +349,76 @@ class Database:
             self._invalidate_ungrounded_priors(connection)
             self._backfill_grounding(connection)
             self._backfill_web_grounding(connection)
+            if previous_version < 4:
+                self._backfill_strategy_attribution(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
-                ("schema_version", "3"),
+                ("schema_version", "4"),
             )
+
+    @staticmethod
+    def _backfill_strategy_attribution(connection: sqlite3.Connection) -> None:
+        """Classify rows written before strategy attribution existed."""
+        connection.execute(
+            """
+            UPDATE forecasts
+            SET strategy = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM state_snapshots s
+                    WHERE s.state_id=forecasts.state_id
+                      AND (
+                          s.source='polymarket-sports-ws'
+                          OR (s.source='pandascore' AND (s.rounds_a + s.rounds_b) > 0)
+                      )
+                ) THEN 'round-live'
+                WHEN EXISTS (
+                    SELECT 1 FROM state_snapshots s
+                    WHERE s.state_id=forecasts.state_id
+                      AND (
+                          s.maps_a + s.maps_b > 0
+                          OR s.source LIKE '%-maps'
+                          OR s.source='canonical-frozen'
+                      )
+                ) THEN 'map-boundary'
+                WHEN EXISTS (
+                    SELECT 1 FROM matches m
+                    WHERE m.match_id=forecasts.match_id
+                      AND m.scheduled_at IS NOT NULL
+                      AND datetime(forecasts.forecast_at)
+                          <= datetime(m.scheduled_at, '+20 minutes')
+                ) THEN 'pre-match'
+                ELSE 'map-boundary'
+            END
+            """
+        )
+        connection.execute(
+            """
+            UPDATE paper_trades
+            SET decision_strategy = COALESCE(
+                    (SELECT f.strategy FROM forecasts f
+                     WHERE f.forecast_id=paper_trades.forecast_id),
+                    'pre-match'
+                ),
+                entry_strategy = COALESCE(
+                    (SELECT f.strategy FROM forecasts f
+                     WHERE f.forecast_id=paper_trades.forecast_id),
+                    'pre-match'
+                )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE paper_positions
+            SET entry_strategy = COALESCE((
+                SELECT t.entry_strategy FROM paper_trades t
+                WHERE t.account_id=paper_positions.account_id
+                  AND t.match_id=paper_positions.match_id
+                  AND t.outcome=paper_positions.outcome
+                  AND t.action='BUY'
+                ORDER BY t.trade_id DESC LIMIT 1
+            ), 'pre-match')
+            """
+        )
 
     @staticmethod
     def _label_legacy_backends(connection: sqlite3.Connection) -> None:
@@ -581,6 +690,65 @@ class Database:
             ).fetchone()
         return int(row["state_id"])
 
+    def record_state_rejection(
+        self,
+        previous: LiveState,
+        candidate: LiveState,
+        reason: str,
+    ) -> int:
+        """Persist a provider transition that the canonical guard refused."""
+        old = previous.normalized()
+        new = candidate.normalized()
+        if old.match_id != new.match_id:
+            raise ValueError("rejected states must reference one match")
+        payload = new.to_dict()
+        digest = _sha(payload)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO state_rejections(
+                    match_id, source, source_at, observed_at, reason,
+                    previous_json, candidate_json, payload_sha256, rejected_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new.match_id,
+                    new.source,
+                    new.source_at,
+                    new.observed_at,
+                    str(reason),
+                    _json(old.to_dict()),
+                    _json(payload),
+                    digest,
+                    isoformat(utc_now()),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT rejection_id FROM state_rejections
+                WHERE match_id=? AND source=? AND source_at=?
+                  AND reason=? AND payload_sha256=?
+                """,
+                (new.match_id, new.source, new.source_at, str(reason), digest),
+            ).fetchone()
+        return int(row["rejection_id"])
+
+    def state_rejection_summary(self, limit: int = 20) -> Dict[str, Any]:
+        with self.connect() as connection:
+            total = int(
+                connection.execute("SELECT count(*) FROM state_rejections").fetchone()[0]
+            )
+            recent = connection.execute(
+                """
+                SELECT rejection_id, match_id, source, source_at, observed_at,
+                       reason, rejected_at
+                FROM state_rejections
+                ORDER BY rejection_id DESC LIMIT ?
+                """,
+                (max(0, int(limit)),),
+            ).fetchall()
+        return {"total": total, "recent": [dict(row) for row in recent]}
+
     def record_book(self, quote: BookQuote) -> int:
         normalized = quote.normalized()
         payload = normalized.to_dict()
@@ -629,15 +797,17 @@ class Database:
         edge_b: float,
         best_side: Optional[str],
         breakdown: Dict[str, Any],
+        strategy: str = "pre-match",
     ) -> int:
+        strategy = validate_strategy(strategy)
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO forecasts(
                     match_id, state_id, book_id, forecast_at, model_version,
                     probability_a, market_midpoint_a, edge_a, edge_b,
-                    best_side, breakdown_json
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    best_side, breakdown_json, strategy
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     match_id,
@@ -651,6 +821,7 @@ class Database:
                     edge_b,
                     best_side,
                     _json(breakdown),
+                    strategy,
                 ),
             )
             row = connection.execute(
@@ -1038,13 +1209,14 @@ class Database:
         skipped: int,
         errors: List[str],
         notices: Optional[List[str]] = None,
+        feed_status: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """
                 UPDATE collector_runs
                 SET finished_at=?, status=?, discovered=?, ticked=?, skipped=?,
-                    errors_json=?, notices_json=?
+                    errors_json=?, notices_json=?, feed_status_json=?
                 WHERE run_id=?
                 """,
                 (
@@ -1055,6 +1227,7 @@ class Database:
                     int(skipped),
                     _json(errors[:50]),
                     _json((notices or [])[:20]),
+                    _json(feed_status or {}),
                     int(run_id),
                 ),
             )
@@ -1078,6 +1251,7 @@ class Database:
         value = dict(row)
         value["errors"] = json.loads(value.pop("errors_json") or "[]")
         value["notices"] = json.loads(value.pop("notices_json", "[]") or "[]")
+        value["feed"] = json.loads(value.pop("feed_status_json", "{}") or "{}")
         return value
 
     def void_match(self, match_id: str, resolved_at: str) -> None:
@@ -1282,7 +1456,7 @@ class Database:
                 """
                 SELECT
                     f.forecast_at, f.probability_a, f.market_midpoint_a,
-                    f.edge_a, f.edge_b, f.best_side, f.model_version,
+                    f.edge_a, f.edge_b, f.best_side, f.model_version, f.strategy,
                     s.maps_a, s.maps_b, s.rounds_a, s.rounds_b, s.current_map,
                     s.source AS state_source, s.source_at AS state_source_at,
                     b.bid_a, b.ask_a, b.bid_b, b.ask_b
@@ -1480,7 +1654,102 @@ class Database:
         account_dict["return"] = (
             account_dict["equity"] / float(account["initial_cash"])
         ) - 1.0
+        account_dict["strategies"] = self.strategy_summary(name)
         return account_dict
+
+    def strategy_summary(self, account_name: str = "live-paper") -> List[Dict[str, Any]]:
+        """Independent decision and PnL attribution for each signal horizon."""
+        summary: Dict[str, Dict[str, Any]] = {
+            strategy: {
+                "strategy": strategy,
+                "decisions": 0,
+                "trades": 0,
+                "buys": 0,
+                "sells": 0,
+                "settles": 0,
+                "realized_pnl": 0.0,
+                "open_positions": 0,
+                "open_cost": 0.0,
+                "mark_value": 0.0,
+                "unrealized_pnl": 0.0,
+                "total_pnl": 0.0,
+            }
+            for strategy in STRATEGIES
+        }
+        with self.connect() as connection:
+            for row in connection.execute(
+                "SELECT strategy, count(*) AS n FROM forecasts GROUP BY strategy"
+            ).fetchall():
+                if row["strategy"] in summary:
+                    summary[row["strategy"]]["decisions"] = int(row["n"])
+
+            account = connection.execute(
+                "SELECT account_id FROM paper_accounts WHERE name=?", (account_name,)
+            ).fetchone()
+            if account is None:
+                return [summary[strategy] for strategy in STRATEGIES]
+            account_id = int(account["account_id"])
+
+            for row in connection.execute(
+                """
+                SELECT decision_strategy,
+                       count(*) AS trades,
+                       sum(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
+                       sum(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
+                       sum(CASE WHEN action='SETTLE' THEN 1 ELSE 0 END) AS settles
+                FROM paper_trades WHERE account_id=?
+                GROUP BY decision_strategy
+                """,
+                (account_id,),
+            ).fetchall():
+                item = summary.get(row["decision_strategy"])
+                if item is not None:
+                    for key in ("trades", "buys", "sells", "settles"):
+                        item[key] = int(row[key] or 0)
+
+            for row in connection.execute(
+                """
+                SELECT entry_strategy, COALESCE(sum(realized_pnl), 0) AS pnl
+                FROM paper_trades WHERE account_id=?
+                GROUP BY entry_strategy
+                """,
+                (account_id,),
+            ).fetchall():
+                item = summary.get(row["entry_strategy"])
+                if item is not None:
+                    item["realized_pnl"] = float(row["pnl"] or 0.0)
+
+            positions = connection.execute(
+                """
+                SELECT p.entry_strategy, p.outcome, p.shares, p.avg_cost,
+                       b.bid_a, b.bid_b
+                FROM paper_positions p
+                LEFT JOIN market_snapshots b ON b.book_id=(
+                    SELECT b2.book_id FROM market_snapshots b2
+                    WHERE b2.match_id=p.match_id
+                    ORDER BY b2.source_at DESC, b2.book_id DESC LIMIT 1
+                )
+                WHERE p.account_id=? AND p.shares>0
+                """,
+                (account_id,),
+            ).fetchall()
+
+        for row in positions:
+            item = summary.get(row["entry_strategy"])
+            if item is None:
+                continue
+            shares = float(row["shares"])
+            cost = shares * float(row["avg_cost"])
+            bid = row["bid_a"] if row["outcome"] == "A" else row["bid_b"]
+            mark = shares * float(bid or 0.0)
+            item["open_positions"] += 1
+            item["open_cost"] += cost
+            item["mark_value"] += mark
+
+        for item in summary.values():
+            item["unrealized_pnl"] = item["mark_value"] - item["open_cost"]
+            item["total_pnl"] = item["realized_pnl"] + item["unrealized_pnl"]
+        return [summary[strategy] for strategy in STRATEGIES]
 
     def dashboard_payload(self, account_name: str = "live-paper") -> Dict[str, Any]:
         with self.connect() as connection:
@@ -1519,6 +1788,7 @@ class Database:
             "counts": counts,
             "latest_forecast_at": latest,
             "collector": self.latest_collector_run(),
+            "state_guard": self.state_rejection_summary(),
             "scoring": self.scoring_summary(),
             "matches": self.latest_rows(),
             "account": self.account_payload(account_name),

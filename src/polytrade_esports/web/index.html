@@ -38,6 +38,15 @@
   <span class="controls-note" id="filter-note">&mdash;</span>
 </div>
 
+<section class="feedrail" aria-label="Sports WebSocket health">
+  <div class="feedcell"><span class="k">SPORTS WS</span><b id="feed-status">&mdash;</b></div>
+  <div class="feedcell"><span class="k">LAST MESSAGE</span><b id="feed-age">&mdash;</b></div>
+  <div class="feedcell"><span class="k">ROUND COVERAGE</span><b id="feed-coverage">&mdash;</b></div>
+  <div class="feedcell"><span class="k">PLACEHOLDERS</span><b id="feed-placeholders">&mdash;</b></div>
+  <div class="feedcell"><span class="k">FROZEN</span><b id="feed-frozen">&mdash;</b></div>
+  <div class="feedcell"><span class="k">REJECTED</span><b id="feed-rejected">&mdash;</b></div>
+</section>
+
 <main>
   <section class="block">
     <h2 class="head"><span class="bar"></span>SCOREBOARD<span class="count" id="c-scored"></span></h2>
@@ -65,6 +74,27 @@
   </section>
 
   <section class="block">
+    <h2 class="head"><span class="bar"></span>STRATEGY ATTRIBUTION</h2>
+    <div class="strategygrid">
+      <article class="strategycard">
+        <span class="k">PRE-MATCH</span><b id="strategy-pre-pnl">&mdash;</b>
+        <div class="sub" id="strategy-pre-meta">&mdash;</div>
+        <div class="sub" id="strategy-pre-open">&mdash;</div>
+      </article>
+      <article class="strategycard">
+        <span class="k">MAP-BOUNDARY</span><b id="strategy-map-pnl">&mdash;</b>
+        <div class="sub" id="strategy-map-meta">&mdash;</div>
+        <div class="sub" id="strategy-map-open">&mdash;</div>
+      </article>
+      <article class="strategycard">
+        <span class="k">ROUND-LIVE</span><b id="strategy-round-pnl">&mdash;</b>
+        <div class="sub" id="strategy-round-meta">&mdash;</div>
+        <div class="sub" id="strategy-round-open">&mdash;</div>
+      </article>
+    </div>
+  </section>
+
+  <section class="block">
     <h2 class="head"><span class="bar"></span>LIVE<span class="count" id="c-live"></span></h2>
     <div id="live-list" class="grid"></div>
   </section>
@@ -83,7 +113,7 @@
     <h2 class="head"><span class="bar"></span>PAPER LEDGER</h2>
     <div class="scroller">
       <table>
-        <thead><tr><th>TIME</th><th>MATCH</th><th>ACT</th><th>SIDE</th><th class="num">SHARES</th><th class="num">PRICE</th><th>REASON</th></tr></thead>
+        <thead><tr><th>TIME</th><th>MATCH</th><th>STRATEGY</th><th>ACT</th><th>SIDE</th><th class="num">SHARES</th><th class="num">PRICE</th><th>REASON</th></tr></thead>
         <tbody id="trades"></tbody>
       </table>
     </div>

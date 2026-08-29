@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional
 from .paper import PaperConfig, rebalance
 from .probability import live_probability
 from .storage import Database
+from .state_guard import validate_strategy
 from .timeutil import isoformat, utc_now
 from .types import BookQuote, LiveState
 
@@ -15,6 +16,7 @@ def tick(
     paper_config: Optional[PaperConfig] = None,
     paper_enabled: bool = True,
     entry_enabled: bool = True,
+    strategy: str = "pre-match",
 ) -> Dict[str, Any]:
     """Record one state/book observation, forecast, and optionally rebalance.
 
@@ -24,6 +26,7 @@ def tick(
     price, and acting on that would be trading on ignorance.
     """
     database.initialize()
+    strategy = validate_strategy(strategy)
     normalized_state = state.normalized()
     normalized_quote = quote.normalized()
     if normalized_state.match_id != normalized_quote.match_id:
@@ -52,6 +55,7 @@ def tick(
         edge_b=edge_b,
         best_side=best_side,
         breakdown=breakdown.to_dict(),
+        strategy=strategy,
     )
     # Drift since our own view last had reason to change.
     anchor_market = database.market_at_last_state_change(
@@ -72,6 +76,7 @@ def tick(
             config=paper_config,
             market_drift=market_drift,
             entry_enabled=entry_enabled,
+            strategy=strategy,
         )
         if paper_enabled
         else []
@@ -90,6 +95,7 @@ def tick(
         "paper_actions": actions,
         "paper_enabled": paper_enabled,
         "entry_enabled": paper_enabled and entry_enabled,
+        "strategy": strategy,
         "market_drift": market_drift,
         "breakdown": breakdown.to_dict(),
         "forecast_at": forecast_at,

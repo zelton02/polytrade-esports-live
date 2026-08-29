@@ -324,6 +324,7 @@ function renderPaper(detail) {
         ["SIDE", p.outcome === "A" ? detail.team_a : detail.team_b],
         ["SHARES", Number(p.shares).toFixed(3)],
         ["AVG COST", pct(p.avg_cost)],
+        ["ENTRY STRATEGY", String(p.entry_strategy || "—").toUpperCase()],
         ["REALIZED", money(p.realized_pnl)],
       ])
     );
@@ -333,7 +334,7 @@ function renderPaper(detail) {
     var table = el("table");
     var head = el("thead");
     var headRow = el("tr");
-    ["TIME", "ACT", "SIDE", "SHARES", "PRICE", "REASON"].forEach(function (h) {
+    ["TIME", "STRATEGY", "ACT", "SIDE", "SHARES", "PRICE", "REASON"].forEach(function (h) {
       headRow.appendChild(el("th", null, h));
     });
     head.appendChild(headRow);
@@ -342,6 +343,7 @@ function renderPaper(detail) {
     trades.forEach(function (t) {
       var row = el("tr");
       row.appendChild(el("td", null, clock(t.traded_at)));
+      row.appendChild(el("td", null, String(t.entry_strategy || t.decision_strategy || "—").toUpperCase()));
       row.appendChild(el("td", t.action === "BUY" ? "buy" : "sell", t.action));
       row.appendChild(el("td", null, t.outcome === "A" ? detail.team_a : detail.team_b));
       row.appendChild(el("td", "num", Number(t.shares).toFixed(3)));
@@ -364,7 +366,7 @@ function renderObservations(detail) {
   if (!rows.length) {
     var empty = el("tr");
     var cell = el("td", null, "No observations yet.");
-    cell.colSpan = 9;
+    cell.colSpan = 10;
     empty.appendChild(cell);
     body.appendChild(empty);
     return;
@@ -379,6 +381,7 @@ function renderObservations(detail) {
     row.appendChild(el("td", null, num(r.maps_a, "0") + "–" + num(r.maps_b, "0")));
     row.appendChild(el("td", null, num(r.rounds_a, "0") + "–" + num(r.rounds_b, "0")));
     row.appendChild(el("td", null, r.current_map || "—"));
+    row.appendChild(el("td", null, String(r.strategy || "—").toUpperCase()));
     row.appendChild(el("td", null, r.state_source || "—"));
     body.appendChild(row);
   });

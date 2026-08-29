@@ -148,6 +148,25 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 }
 
 .controls-note { color: var(--faint); font-size: 10px; letter-spacing: 0.1em; }
+.feedrail {
+  position: relative; z-index: 2;
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+  border-bottom: 1px solid var(--line);
+  background: #07110e;
+}
+.feedcell { min-width: 0; padding: 9px var(--gut); border-left: 1px solid var(--line); }
+.feedcell:first-child { border-left: 0; }
+.feedcell .k {
+  display: block; color: var(--faint); font-size: 8.5px; letter-spacing: 0.17em;
+}
+.feedcell b {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-top: 4px; color: var(--dim); font: 600 11px/1.2 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.feedcell b.good { color: var(--phos); }
+.feedcell b.warn { color: var(--amber); }
+.feedcell b.bad { color: var(--blood); }
 .block { margin-top: 32px; }
 
 .head {
@@ -372,6 +391,23 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 }
 .caveat.warn { color: var(--amber); }
 
+/* Strategy attribution -------------------------------------------------- */
+
+.strategygrid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px; padding: 1px; background: var(--line);
+}
+.strategycard { min-width: 0; background: var(--panel); padding: 14px; }
+.strategycard .k { color: var(--faint); font-size: 9px; letter-spacing: 0.18em; }
+.strategycard b {
+  display: block; margin: 7px 0 6px;
+  font: 700 clamp(17px, 2.2vw, 23px)/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.strategycard b.up { color: var(--phos); }
+.strategycard b.down { color: var(--blood); }
+.strategycard .sub { color: var(--faint); font-size: 9.5px; line-height: 1.55; }
+
 /* Collapsible section. Used for the raw observation log: it is the audit
    trail behind the trajectory chart, so it should stay reachable, but a
    hundred rows of ticks is not what the page is for. */
@@ -430,12 +466,19 @@ tbody tr:hover td { background: rgba(63,240,168,0.03); }
   .cell:nth-child(3n+1) { border-left: 0; }
   .cell:nth-child(n+4) { border-top: 1px solid var(--line); }
   .scoregrid { grid-template-columns: 1fr; }
+  .feedrail { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .feedcell:nth-child(3n+1) { border-left: 0; }
+  .feedcell:nth-child(n+4) { border-top: 1px solid var(--line); }
 }
 @media (max-width: 620px) {
   .rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cell:nth-child(2n+1) { border-left: 0; }
   .cell:nth-child(n+3) { border-top: 1px solid var(--line); }
   .grid { grid-template-columns: 1fr; }
+  .feedrail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .feedcell:nth-child(2n+1) { border-left: 0; }
+  .feedcell:nth-child(n+3) { border-top: 1px solid var(--line); }
+  .strategygrid { grid-template-columns: 1fr; }
   .masthead { align-items: flex-start; }
   .beacon { text-align: left; }
   .beacon-row { justify-content: flex-start; }

@@ -22,11 +22,13 @@ from .paper import PaperConfig
 from .polymarket import PolymarketBookClient
 from .resolver import resolve_known_events, resolve_open_matches
 from .sports_ws import (
+    MAPS_ONLY_SOURCE as SPORTS_MAPS_ONLY_SOURCE,
     SOURCE as SPORTS_SOURCE,
     SPORTS_WS_URL,
     TERMINAL_SOURCE as SPORTS_TERMINAL_SOURCE,
     SportsWebSocketAdapter,
 )
+from .state_guard import canonicalize_state, strategy_for_state
 from .storage import Database
 from .timeutil import isoformat, parse_timestamp, utc_now
 from .types import LiveState
@@ -102,6 +104,7 @@ class CycleResult:
     # surfacing but are not failures, so they must not degrade the run status.
     notices: List[str] = field(default_factory=list)
     forecasts: List[Dict[str, Any]] = field(default_factory=list)
+    feed_health: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,7 +119,48 @@ class CycleResult:
             "errors": self.errors,
             "notices": self.notices,
             "forecasts": self.forecasts,
+            "feed_health": self.feed_health,
         }
+
+
+def _sports_status(
+    sports: Optional[SportsWebSocketAdapter], settings: CollectorConfig
+) -> Dict[str, Any]:
+    status: Dict[str, Any] = {
+        "enabled": bool(settings.sports_ws_enabled),
+        "connected": False,
+        "url": settings.sports_ws_url,
+        "updates": 0,
+        "last_message_at": "",
+        "last_message_age_seconds": None,
+        "last_error": "",
+        "max_age_seconds": float(settings.sports_max_age_seconds),
+    }
+    if sports is not None:
+        reporter = getattr(sports, "status", None)
+        if callable(reporter):
+            try:
+                status.update(dict(reporter()))
+            except Exception as error:
+                status["last_error"] = "status unavailable: %s" % error
+        else:
+            status["connected"] = bool(getattr(sports, "connected", False))
+            status["last_error"] = str(getattr(sports, "last_error", "") or "")
+    last_message = status.get("last_message_at")
+    if last_message:
+        try:
+            status["last_message_age_seconds"] = max(
+                0.0, (utc_now() - parse_timestamp(str(last_message))).total_seconds()
+            )
+        except ValueError:
+            status["last_message_age_seconds"] = None
+    age = status.get("last_message_age_seconds")
+    status["stale"] = bool(
+        not status.get("connected")
+        or age is None
+        or float(age) > float(settings.sports_max_age_seconds)
+    )
+    return status
 
 
 def _should_tick(row: Dict[str, Any], window_hours: float) -> bool:
@@ -182,6 +226,19 @@ def run_cycle(
     gamma_client = gamma or GammaClient()
     book_client = books or PolymarketBookClient()
     result = CycleResult()
+    result.feed_health = _sports_status(sports, settings)
+    result.feed_health.update(
+        {
+            "tracked_live": 0,
+            "round_level": 0,
+            "maps_only": 0,
+            "placeholder_count": 0,
+            "frozen_states": 0,
+            "rejected_transitions": 0,
+            "missing_provider_id": 0,
+            "round_coverage": None,
+        }
+    )
     database.initialize()
     database.ensure_account(settings.account_name)
     run_id = database.start_collector_run()
@@ -285,9 +342,40 @@ def run_cycle(
             result.skipped += 1
             continue
         try:
-            state = _resolve_state(
+            live = bool(record.get("live"))
+            if live:
+                result.feed_health["tracked_live"] += 1
+                if not str(row.get("provider_match_id") or ""):
+                    result.feed_health["missing_provider_id"] += 1
+            candidate_state = _resolve_state(
                 database, panda, live_by_provider, row, record, result, gate, sports
             )
+            try:
+                previous_state: Optional[LiveState] = database.latest_state(match_id)
+            except KeyError:
+                previous_state = None
+            candidate_has_rounds = _has_round_detail(candidate_state)
+            decision = canonicalize_state(
+                previous_state, candidate_state, candidate_has_rounds
+            )
+            if not decision.accepted and previous_state is not None:
+                database.record_state_rejection(
+                    previous_state, candidate_state, decision.reason
+                )
+                result.feed_health["rejected_transitions"] += 1
+                result.notices.append(
+                    "%s: canonical state rejected (%s)" % (match_id, decision.reason)
+                )
+            if decision.frozen:
+                result.feed_health["frozen_states"] += 1
+            if live:
+                if candidate_state.source == SPORTS_MAPS_ONLY_SOURCE:
+                    result.feed_health["placeholder_count"] += 1
+                if candidate_has_rounds and decision.accepted:
+                    result.feed_health["round_level"] += 1
+                else:
+                    result.feed_health["maps_only"] += 1
+            state = decision.state
             quote = book_client.get_pair(match_id, row["token_a"], row["token_b"])
             # Two ways a match has no view worth trading, and both produce a
             # number that looks like one. A seed prior is the absence of a
@@ -299,10 +387,13 @@ def run_cycle(
             has_prior = str(row.get("prior_source") or "seed") != "seed"
             fully_grounded = int(row.get("prior_grounded_teams") or 0) >= 2
             paper_enabled = has_prior and fully_grounded
-            round_feed_ready = not record.get("live") or _has_round_detail(state)
-            if record.get("live") and not round_feed_ready:
+            round_feed_ready = not live or (candidate_has_rounds and decision.accepted)
+            if live and not round_feed_ready:
                 if ROUND_FEED_NOTICE not in result.notices:
                     result.notices.append(ROUND_FEED_NOTICE)
+            strategy = strategy_for_state(
+                live, previous_state, candidate_state, candidate_has_rounds
+            )
             outcome = tick(
                 database=database,
                 state=state,
@@ -311,6 +402,7 @@ def run_cycle(
                 paper_config=settings.paper,
                 paper_enabled=paper_enabled,
                 entry_enabled=paper_enabled and round_feed_ready,
+                strategy=strategy,
             )
             result.ticked += 1
             result.forecasts.append(
@@ -325,6 +417,7 @@ def run_cycle(
                     "paper_enabled": outcome["paper_enabled"],
                     "entry_enabled": outcome["entry_enabled"],
                     "state_source": state.source,
+                    "strategy": strategy,
                 }
             )
         except Exception as error:
@@ -344,6 +437,23 @@ def run_cycle(
             result.errors.extend(settlement.errors[:5])
         except Exception as error:
             result.errors.append("resolution failed: %s" % error)
+
+    adapter_status = _sports_status(sports, settings)
+    counters = {
+        key: result.feed_health[key]
+        for key in (
+            "tracked_live", "round_level", "maps_only", "placeholder_count",
+            "frozen_states", "rejected_transitions", "missing_provider_id",
+        )
+    }
+    result.feed_health.update(adapter_status)
+    result.feed_health.update(counters)
+    tracked_live = int(result.feed_health["tracked_live"])
+    result.feed_health["round_coverage"] = (
+        float(result.feed_health["round_level"]) / tracked_live
+        if tracked_live
+        else None
+    )
 
     status = "completed" if not result.errors else ("partial" if result.ticked else "failed")
     if (
@@ -375,6 +485,7 @@ def run_cycle(
         skipped=result.skipped,
         errors=result.errors,
         notices=persisted_notices,
+        feed_status=result.feed_health,
     )
     return result
 

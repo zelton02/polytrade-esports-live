@@ -154,6 +154,11 @@ class CollectorTests(unittest.TestCase):
             "polymarket-sports-ws",
         )
         self.assertGreater(self.db.dashboard_payload()["counts"]["trades"], 0)
+        self.assertEqual(result.forecasts[0]["strategy"], "round-live")
+        self.assertEqual(result.feed_health["round_coverage"], 1.0)
+        self.assertEqual(
+            self.db.latest_collector_run()["feed"]["round_level"], 1
+        )
 
     def test_live_maps_only_state_pauses_entries_but_keeps_forecasting(self):
         run_cycle(self.db, self.config, gamma=FakeGamma([live_event()]), books=FakeBooks())
@@ -183,6 +188,48 @@ class CollectorTests(unittest.TestCase):
         self.assertFalse(result.forecasts[0]["entry_enabled"])
         self.assertIn(collector_module.ROUND_FEED_NOTICE, result.notices)
         self.assertEqual(self.db.dashboard_payload()["counts"]["trades"], 0)
+        self.assertEqual(result.forecasts[0]["strategy"], "map-boundary")
+        self.assertEqual(result.feed_health["round_coverage"], 0.0)
+
+    def test_round_regression_is_frozen_paused_and_audited(self):
+        class RegressingSports:
+            connected = True
+            last_error = ""
+
+            def __init__(self):
+                self.calls = 0
+
+            def state_for(self, provider_match_id, match_id, team_a, team_b):
+                self.calls += 1
+                rounds = (9, 4) if self.calls == 1 else (8, 5)
+                now = isoformat(utc_now())
+                return LiveState(
+                    match_id=match_id,
+                    source_at=now,
+                    observed_at=now,
+                    maps_a=0,
+                    maps_b=0,
+                    rounds_a=rounds[0],
+                    rounds_b=rounds[1],
+                    current_map="Map 1",
+                    source="polymarket-sports-ws",
+                ).normalized()
+
+        sports = RegressingSports()
+        run_cycle(
+            self.db, self.config, gamma=FakeGamma([live_event()]),
+            books=FakeBooks(), sports=sports,
+        )
+        second = run_cycle(
+            self.db, self.config, gamma=FakeGamma([live_event()]),
+            books=FakeBooks(), sports=sports,
+        )
+        latest = self.db.latest_state(FIXTURE["slug"])
+        self.assertEqual((latest.rounds_a, latest.rounds_b), (9, 4))
+        self.assertEqual(latest.source, "canonical-frozen")
+        self.assertFalse(second.forecasts[0]["entry_enabled"])
+        self.assertEqual(second.feed_health["rejected_transitions"], 1)
+        self.assertEqual(self.db.state_rejection_summary()["total"], 1)
 
     def test_a_half_grounded_prior_does_not_open_a_position(self):
         """An abstention wearing a forecast's clothes must not size a trade.

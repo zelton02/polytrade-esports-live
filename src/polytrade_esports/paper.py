@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .storage import Database
+from .state_guard import validate_strategy
 from .timeutil import isoformat, utc_now
 from .types import BookQuote
 
@@ -51,9 +52,11 @@ def rebalance(
     config: Optional[PaperConfig] = None,
     market_drift: Optional[float] = None,
     entry_enabled: bool = True,
+    strategy: str = "pre-match",
 ) -> List[Dict[str, Any]]:
     settings = config or PaperConfig()
     settings.validate()
+    strategy = validate_strategy(strategy)
     account_id = database.ensure_account(account_name)
     q = quote.normalized()
     now = isoformat(utc_now())
@@ -147,6 +150,7 @@ def rebalance(
             remaining = available - amount
             new_avg = float(position["avg_cost"]) if remaining > 1e-12 else 0.0
             new_realized = float(position["realized_pnl"]) + pnl
+            entry_strategy = str(position["entry_strategy"] or strategy)
             cash += proceeds
             connection.execute(
                 """
@@ -160,10 +164,14 @@ def rebalance(
                 """
                 INSERT INTO paper_trades(
                     account_id, match_id, forecast_id, action, outcome, shares,
-                    price, cash_delta, realized_pnl, reason, traded_at
-                ) VALUES(?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?, ?)
+                    price, cash_delta, realized_pnl, decision_strategy,
+                    entry_strategy, reason, traded_at
+                ) VALUES(?, ?, ?, 'SELL', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (account_id, match_id, forecast_id, outcome, amount, price, proceeds, pnl, reason, now),
+                (
+                    account_id, match_id, forecast_id, outcome, amount, price,
+                    proceeds, pnl, strategy, entry_strategy, reason, now,
+                ),
             )
             positions[outcome] = connection.execute(
                 """
@@ -173,7 +181,11 @@ def rebalance(
                 (account_id, match_id, outcome),
             ).fetchone()
             actions.append(
-                {"action": "SELL", "outcome": outcome, "shares": amount, "price": price, "reason": reason}
+                {
+                    "action": "SELL", "outcome": outcome, "shares": amount,
+                    "price": price, "reason": reason,
+                    "decision_strategy": strategy, "entry_strategy": entry_strategy,
+                }
             )
 
         def buy(outcome: str, shares: float, reason: str) -> None:
@@ -186,6 +198,11 @@ def rebalance(
                 return
             position = positions[outcome]
             old_shares = float(position["shares"])
+            entry_strategy = (
+                str(position["entry_strategy"] or strategy)
+                if old_shares > 1e-12
+                else strategy
+            )
             old_cost = old_shares * float(position["avg_cost"])
             cost = amount * price
             new_shares = old_shares + amount
@@ -194,19 +211,26 @@ def rebalance(
             connection.execute(
                 """
                 UPDATE paper_positions
-                SET shares=?, avg_cost=?, updated_at=?
+                SET shares=?, avg_cost=?, entry_strategy=?, updated_at=?
                 WHERE account_id=? AND match_id=? AND outcome=?
                 """,
-                (new_shares, new_avg, now, account_id, match_id, outcome),
+                (
+                    new_shares, new_avg, entry_strategy, now,
+                    account_id, match_id, outcome,
+                ),
             )
             connection.execute(
                 """
                 INSERT INTO paper_trades(
                     account_id, match_id, forecast_id, action, outcome, shares,
-                    price, cash_delta, realized_pnl, reason, traded_at
-                ) VALUES(?, ?, ?, 'BUY', ?, ?, ?, ?, 0, ?, ?)
+                    price, cash_delta, realized_pnl, decision_strategy,
+                    entry_strategy, reason, traded_at
+                ) VALUES(?, ?, ?, 'BUY', ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
-                (account_id, match_id, forecast_id, outcome, amount, price, -cost, reason, now),
+                (
+                    account_id, match_id, forecast_id, outcome, amount, price,
+                    -cost, strategy, entry_strategy, reason, now,
+                ),
             )
             positions[outcome] = connection.execute(
                 """
@@ -216,7 +240,11 @@ def rebalance(
                 (account_id, match_id, outcome),
             ).fetchone()
             actions.append(
-                {"action": "BUY", "outcome": outcome, "shares": amount, "price": price, "reason": reason}
+                {
+                    "action": "BUY", "outcome": outcome, "shares": amount,
+                    "price": price, "reason": reason,
+                    "decision_strategy": strategy, "entry_strategy": entry_strategy,
+                }
             )
 
         # A side flip always closes the old outcome first.
@@ -282,6 +310,7 @@ def settle_match(
             payout_price = 1.0 if position["outcome"] == winner else 0.0
             payout = shares * payout_price
             pnl = payout - (shares * float(position["avg_cost"]))
+            entry_strategy = str(position["entry_strategy"] or "pre-match")
             cash += payout
             connection.execute(
                 """
@@ -295,8 +324,9 @@ def settle_match(
                 """
                 INSERT INTO paper_trades(
                     account_id, match_id, forecast_id, action, outcome, shares,
-                    price, cash_delta, realized_pnl, reason, traded_at
-                ) VALUES(?, ?, ?, 'SETTLE', ?, ?, ?, ?, ?, 'resolution', ?)
+                    price, cash_delta, realized_pnl, decision_strategy,
+                    entry_strategy, reason, traded_at
+                ) VALUES(?, ?, ?, 'SETTLE', ?, ?, ?, ?, ?, ?, ?, 'resolution', ?)
                 """,
                 (
                     account_id,
@@ -307,6 +337,8 @@ def settle_match(
                     payout_price,
                     payout,
                     pnl,
+                    entry_strategy,
+                    entry_strategy,
                     now,
                 ),
             )

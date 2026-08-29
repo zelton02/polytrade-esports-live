@@ -153,6 +153,12 @@ function money(value) {
     : "$" + Number(value).toFixed(2);
 }
 
+function signedMoney(value) {
+  if (value === null || value === undefined || isNaN(value)) return "—";
+  var amount = Number(value);
+  return (amount >= 0 ? "+" : "−") + "$" + Math.abs(amount).toFixed(2);
+}
+
 function whole(value) {
   return value === null || value === undefined || isNaN(value)
     ? "—"
@@ -480,7 +486,7 @@ function syncTrades(node, trades) {
   if (!trades.length) {
     var row = el("tr");
     var cell = el("td", null, "No paper trades yet.");
-    cell.colSpan = 7;
+    cell.colSpan = 8;
     row.appendChild(cell);
     node.appendChild(row);
     return;
@@ -489,6 +495,7 @@ function syncTrades(node, trades) {
     var line = el("tr");
     line.appendChild(el("td", null, clock(trade.traded_at)));
     line.appendChild(el("td", null, trade.team_a + " – " + trade.team_b));
+    line.appendChild(el("td", null, String(trade.entry_strategy || trade.decision_strategy || "—").toUpperCase()));
     line.appendChild(el("td", trade.action === "BUY" ? "buy" : "sell", trade.action));
     line.appendChild(el("td", null, trade.outcome));
     line.appendChild(el("td", "num", Number(trade.shares).toFixed(3)));
@@ -496,6 +503,61 @@ function syncTrades(node, trades) {
     line.appendChild(el("td", null, trade.reason));
     node.appendChild(line);
   });
+}
+
+function renderStrategies(strategies) {
+  var byName = Object.create(null);
+  (strategies || []).forEach(function (item) { byName[item.strategy] = item; });
+  [
+    ["pre-match", "pre"],
+    ["map-boundary", "map"],
+    ["round-live", "round"],
+  ].forEach(function (pair) {
+    var item = byName[pair[0]] || {};
+    var pnl = Number(item.total_pnl || 0);
+    var pnlNode = document.getElementById("strategy-" + pair[1] + "-pnl");
+    setNumber(pnlNode, pnl, signedMoney);
+    setClass(pnlNode, pnl > 0 ? "up" : pnl < 0 ? "down" : "");
+    setText(
+      document.getElementById("strategy-" + pair[1] + "-meta"),
+      "DECISIONS " + whole(item.decisions || 0) + " · TRADES " + whole(item.trades || 0) +
+        " · REALIZED " + signedMoney(item.realized_pnl || 0)
+    );
+    setText(
+      document.getElementById("strategy-" + pair[1] + "-open"),
+      "OPEN " + whole(item.open_positions || 0) + " · MARK " + money(item.mark_value || 0)
+    );
+  });
+}
+
+function renderFeedHealth(data) {
+  var run = data.collector || {};
+  var feed = run.feed || {};
+  var enabled = feed.enabled !== false;
+  var connected = !!feed.connected;
+  var stale = !!feed.stale;
+  var statusNode = document.getElementById("feed-status");
+  setText(statusNode, !enabled ? "DISABLED" : connected ? (stale ? "STALE" : "CONNECTED") : "DISCONNECTED");
+  setClass(statusNode, !enabled ? "warn" : !connected ? "bad" : stale ? "warn" : "good");
+  setText(
+    document.getElementById("feed-age"),
+    feed.last_message_age_seconds === null || feed.last_message_age_seconds === undefined
+      ? "—"
+      : Math.round(Number(feed.last_message_age_seconds)) + "s"
+  );
+  setText(
+    document.getElementById("feed-coverage"),
+    feed.round_coverage === null || feed.round_coverage === undefined
+      ? "IDLE"
+      : pct(feed.round_coverage) + " · " + whole(feed.round_level || 0) + "/" + whole(feed.tracked_live || 0)
+  );
+  setText(document.getElementById("feed-placeholders"), whole(feed.placeholder_count || 0));
+  setText(document.getElementById("feed-frozen"), whole(feed.frozen_states || 0));
+  var rejected = (data.state_guard || {}).total;
+  setText(
+    document.getElementById("feed-rejected"),
+    whole(rejected || 0) + " TOTAL · " + whole(feed.rejected_transitions || 0) + " CYCLE"
+  );
 }
 
 /* Scoreboard ------------------------------------------------------------- */
@@ -595,6 +657,7 @@ function render(data) {
   setClass(returnNode, account.return >= 0 ? "up" : "down");
 
   var run = data.collector;
+  renderFeedHealth(data);
   setText(
     document.getElementById("cycle"),
     "SYNC " + clock(data.generated_at) +
@@ -602,11 +665,18 @@ function render(data) {
   );
 
   var freshness = ageMs(data.latest_forecast_at);
+  var feed = run && run.feed;
   var mapsOnly = run && (run.notices || []).some(function (notice) {
     return String(notice).toLowerCase().indexOf("maps-only") >= 0;
   });
   if (!data.latest_forecast_at) setBeacon("stale", "AWAITING DATA");
   else if (freshness > STALE_MS) setBeacon("stale", "STALE FEED");
+  else if (feed && counts.live && !feed.connected) setBeacon("down", "SPORTS WS DOWN");
+  else if (feed && counts.live && feed.stale) setBeacon("stale", "ROUND FEED STALE");
+  else if (
+    feed && counts.live && feed.round_coverage !== null &&
+    feed.round_coverage !== undefined && feed.round_coverage < 1
+  ) setBeacon("stale", "PARTIAL ROUND FEED");
   else if (mapsOnly) setBeacon("stale", "MAPS-ONLY FEED");
   else setBeacon(null, "LIVE FEED");
 
@@ -687,6 +757,7 @@ function render(data) {
       : "No upcoming matches tracked."
   );
   renderScoreboard(data.scoring);
+  renderStrategies(account.strategies || []);
   syncTrades(document.getElementById("trades"), account.trades || []);
 }
 

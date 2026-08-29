@@ -34,7 +34,22 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LiveState("m1", future, 0, 0, 0, 0, observed_at=future).normalized()
 
+    def test_rejected_transition_is_auditable(self):
+        old = LiveState(
+            "m1", "2026-08-27T00:00:00Z", 0, 0, 9, 4,
+            observed_at="2026-08-27T00:00:00Z", source="sports",
+        )
+        new = LiveState(
+            "m1", "2026-08-27T00:00:05Z", 0, 0, 8, 5,
+            observed_at="2026-08-27T00:00:05Z", source="sports",
+        )
+        first = self.db.record_state_rejection(old, new, "same_map_round_score_regressed")
+        second = self.db.record_state_rejection(old, new, "same_map_round_score_regressed")
+        report = self.db.state_rejection_summary()
+        self.assertEqual(first, second)
+        self.assertEqual(report["total"], 1)
+        self.assertEqual(report["recent"][0]["reason"], "same_map_round_score_regressed")
+
 
 if __name__ == "__main__":
     unittest.main()
-

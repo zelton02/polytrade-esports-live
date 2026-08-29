@@ -30,6 +30,22 @@ class EnginePaperTests(unittest.TestCase):
         spent = 1000.0 - account["cash"]
         self.assertLessEqual(spent, 10.0 + 1e-8)
 
+    def test_strategy_is_written_to_forecast_trade_position_and_summary(self):
+        state = LiveState("m1", STAMP, 0, 0, 4, 2, observed_at=STAMP)
+        quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        result = tick(self.db, state, quote, strategy="round-live")
+        self.assertEqual(result["strategy"], "round-live")
+        account = self.db.account_payload()
+        self.assertEqual(account["trades"][0]["decision_strategy"], "round-live")
+        self.assertEqual(account["trades"][0]["entry_strategy"], "round-live")
+        self.assertEqual(account["positions"][0]["entry_strategy"], "round-live")
+        cohort = next(
+            item for item in account["strategies"] if item["strategy"] == "round-live"
+        )
+        self.assertEqual(cohort["decisions"], 1)
+        self.assertEqual(cohort["trades"], 1)
+        self.assertEqual(cohort["open_positions"], 1)
+
     def test_no_entry_without_required_edge(self):
         self.db.add_match(Match("m2", "C", "D", 3, 0.50))
         state = LiveState("m2", STAMP, 0, 0, 0, 0, observed_at=STAMP)

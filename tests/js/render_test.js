@@ -395,6 +395,42 @@ const tests = {
     assert.ok(document.getElementById("live-dot").className.indexOf("stale") >= 0);
   },
 
+  "sports websocket health is visible without reading collector logs"() {
+    const { context, document } = boot();
+    const data = payload([match()]);
+    data.collector.feed = {
+      enabled: true, connected: true, stale: false,
+      last_message_age_seconds: 7.4,
+      round_coverage: 0.5, round_level: 1, tracked_live: 2,
+      placeholder_count: 1, frozen_states: 1, rejected_transitions: 1,
+    };
+    data.state_guard = { total: 4 };
+    context.render(data);
+    assert.strictEqual(document.getElementById("feed-status").textContent, "CONNECTED");
+    assert.strictEqual(document.getElementById("feed-age").textContent, "7s");
+    assert.ok(/50.0%/.test(document.getElementById("feed-coverage").textContent));
+    assert.ok(/4 TOTAL/.test(document.getElementById("feed-rejected").textContent));
+    assert.strictEqual(document.getElementById("live-label").textContent, "PARTIAL ROUND FEED");
+  },
+
+  "strategy cohorts report separate decisions trades and pnl"() {
+    const { context, document } = boot();
+    const data = payload([match()]);
+    data.account.strategies = [
+      { strategy: "pre-match", decisions: 8, trades: 2, realized_pnl: 1.2,
+        open_positions: 0, mark_value: 0, total_pnl: 1.2 },
+      { strategy: "map-boundary", decisions: 3, trades: 1, realized_pnl: -0.5,
+        open_positions: 1, mark_value: 4, total_pnl: -0.2 },
+      { strategy: "round-live", decisions: 20, trades: 4, realized_pnl: 0,
+        open_positions: 2, mark_value: 8.5, total_pnl: 0.75 },
+    ];
+    context.render(data);
+    assert.strictEqual(document.getElementById("strategy-pre-pnl").textContent, "+$1.20");
+    assert.ok(/DECISIONS 20/.test(document.getElementById("strategy-round-meta").textContent));
+    assert.ok(/OPEN 2/.test(document.getElementById("strategy-round-open").textContent));
+    assert.ok(document.getElementById("strategy-map-pnl").className.indexOf("down") >= 0);
+  },
+
   "the card separates a grounded prior from an ungrounded one"() {
     const { context, document } = boot({ stored: { "polytrade.aiPricedOnly": "0" } });
     context.render(payload([match()]));
