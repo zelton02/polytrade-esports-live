@@ -178,7 +178,7 @@ services:
       - --monthly-budget-usd
       - "1.0"
       - --max-cost-per-run
-      - "0.01"
+      - "0.02"
       - --min-liquidity
       - "20000"
       - --min-lead-minutes

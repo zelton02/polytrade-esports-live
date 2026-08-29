@@ -505,9 +505,9 @@ the members finish and stored separately for later comparison.
 ```bash
 python3 -m polytrade_esports shadow-panel \
   --db data/esports_live.sqlite3 --backend deepseek \
-  --model deepseek-v4-flash --limit 1 \
+  --model deepseek-v4-pro --limit 1 \
   --daily-run-limit 20 --monthly-budget-usd 1.0 \
-  --max-cost-per-run 0.01 --min-lead-minutes 10 \
+  --max-cost-per-run 0.02 --min-lead-minutes 10 \
   --cached-facts-only --dry-run
 ```
 
