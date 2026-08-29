@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/test.yml"
 DEPLOY_SCRIPT = ROOT / "deploy/deploy.sh"
+SYNC_SCRIPT = ROOT / "deploy/sync-production.sh"
 
 
 class DeploymentWorkflowContractTests(unittest.TestCase):
@@ -15,6 +17,7 @@ class DeploymentWorkflowContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = WORKFLOW.read_text()
         cls.deploy_script = DEPLOY_SCRIPT.read_text()
+        cls.sync_script = SYNC_SCRIPT.read_text()
 
     def test_only_main_pushes_can_deploy_after_every_test_job(self):
         self.assertIn("branches:\n      - main", self.workflow)
@@ -39,9 +42,14 @@ class DeploymentWorkflowContractTests(unittest.TestCase):
             self.assertIn("secrets.%s" % secret, self.workflow)
         self.assertIn("StrictHostKeyChecking yes", self.workflow)
         self.assertNotIn("StrictHostKeyChecking=no", self.workflow)
-        self.assertNotIn("--delete", self.workflow)
+        self.assertIn("bash deploy/sync-production.sh", self.workflow)
+        self.assertIn("--dry-run", self.sync_script)
+        self.assertIn("--delete-delay", self.sync_script)
+        self.assertNotIn("--delete-excluded", self.sync_script)
+        for protected in ("protect /.env", "protect /data/***", "protect backups/***"):
+            self.assertIn(protected, self.sync_script)
         for exclusion in ("'/.env'", "'/data/'", "'*.sqlite3'", "'backups/'"):
-            self.assertIn("--exclude=%s" % exclusion, self.workflow)
+            self.assertIn("--exclude=%s" % exclusion, self.sync_script)
 
     def test_backup_finishes_before_source_sync_and_is_reverified(self):
         backup = self.workflow.index("Back up production SQLite before code sync")
@@ -95,6 +103,42 @@ class DeploymentBackupFailureTests(unittest.TestCase):
             self.assertIn("SQLite .backup failed; deployment has not started", result.stderr)
             self.assertFalse(docker_marker.exists())
             self.assertEqual(list((data / "backups").glob("*.sqlite3")), [])
+
+
+@unittest.skipUnless(shutil.which("rsync"), "rsync is not installed")
+class ProductionSyncSafetyTests(unittest.TestCase):
+    def test_obsolete_code_is_deleted_but_production_state_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "source"
+            destination = root / "destination"
+            (source / "src").mkdir(parents=True)
+            (destination / "src" / "__pycache__").mkdir(parents=True)
+            (destination / "data" / "backups").mkdir(parents=True)
+            (source / "src" / "current.py").write_text("current\n")
+            (destination / "src" / "obsolete.py").write_text("obsolete\n")
+            (destination / "src" / "__pycache__" / "old.pyc").write_bytes(b"old")
+            (destination / ".env").write_text("DASHBOARD_SECRET=preserve\n")
+            database = destination / "data" / "esports_live.sqlite3"
+            database.write_bytes(b"production-db")
+            backup = destination / "data" / "backups" / "before.sqlite3"
+            backup.write_bytes(b"production-backup")
+
+            result = subprocess.run(
+                ["bash", str(SYNC_SCRIPT), str(source), str(destination)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((destination / "src" / "current.py").is_file())
+            self.assertFalse((destination / "src" / "obsolete.py").exists())
+            self.assertFalse((destination / "src" / "__pycache__").exists())
+            self.assertEqual((destination / ".env").read_text(), "DASHBOARD_SECRET=preserve\n")
+            self.assertEqual(database.read_bytes(), b"production-db")
+            self.assertEqual(backup.read_bytes(), b"production-backup")
 
 
 if __name__ == "__main__":

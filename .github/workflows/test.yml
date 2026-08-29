@@ -138,16 +138,7 @@ jobs:
           echo "path=$backup_path" >> "$GITHUB_OUTPUT"
 
       - name: Safely synchronize production source
-        run: |
-          rsync -az --itemize-changes \
-            --exclude='/.git/' \
-            --exclude='/.env' \
-            --exclude='/data/' \
-            --exclude='/.DS_Store' \
-            --exclude='*.sqlite3' \
-            --exclude='*.sqlite3-*' \
-            --exclude='backups/' \
-            ./ "production:$PROD_ROOT/"
+        run: bash deploy/sync-production.sh . "production:$PROD_ROOT"
 
       - name: Deploy and verify production
         env:

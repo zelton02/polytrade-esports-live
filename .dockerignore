@@ -7,3 +7,5 @@ examples
 deploy
 *.md
 *.sqlite3
+**/__pycache__/
+**/*.py[cod]
