@@ -227,7 +227,7 @@ ROOT_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8788/)"
 integrity_check "$DATABASE_PATH" || fail "production database integrity_check did not return ok"
 SCHEMA_VERSION="$(sqlite3 -readonly "$DATABASE_PATH" \
     "SELECT value FROM metadata WHERE key='schema_version';")"
-[ "$SCHEMA_VERSION" = "7" ] || fail "metadata schema_version is $SCHEMA_VERSION instead of 7"
+[ "$SCHEMA_VERSION" = "8" ] || fail "metadata schema_version is $SCHEMA_VERSION instead of 8"
 ACCOUNT_COUNT="$(sqlite3 -readonly "$DATABASE_PATH" \
     "SELECT count(*) FROM paper_accounts WHERE name IN ('live-paper','grounded-paper','execution-paper','execution-paper-v2');")"
 [ "$ACCOUNT_COUNT" = "4" ] || fail "one or more protected paper accounts are missing"
@@ -250,7 +250,7 @@ for _ in $(seq 1 30); do
 done
 [ "$EXECUTOR_READY" -eq 1 ] || \
     fail "executor status/heartbeat is not fresh: $EXECUTOR_STATE"
-echo "database integrity=ok schema=7 executor=$EXECUTOR_STATE"
+echo "database integrity=ok schema=8 executor=$EXECUTOR_STATE"
 
 ERROR_PATTERN='Traceback|Exception|FATAL|PANIC|(^|[[:space:]])ERROR([[:space:]:]|$)'
 for SERVICE in "${SERVICES[@]}"; do

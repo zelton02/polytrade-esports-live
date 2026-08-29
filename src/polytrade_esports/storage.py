@@ -357,6 +357,10 @@ CREATE TABLE IF NOT EXISTS shadow_panel_runs (
     usage_json TEXT NOT NULL DEFAULT '{}',
     estimated_cost_usd REAL NOT NULL DEFAULT 0,
     errors_json TEXT NOT NULL DEFAULT '[]',
+    -- Captured at run time because matches.liquidity drifts: comparing the
+    -- panel against the market is only decision-relevant on books deep enough
+    -- to trade, so the analysis has to stratify on the depth we actually saw.
+    liquidity_at_run REAL,
     applied INTEGER NOT NULL DEFAULT 0 CHECK (applied = 0),
     UNIQUE(match_id, panel_version, model, backend)
 );
@@ -409,6 +413,10 @@ PRIOR_COLUMNS = (
     # the reasoning against its inputs instead of taking the summary on trust.
     ("verified_facts", "TEXT NOT NULL DEFAULT ''"),
     ("grounded_teams", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+SHADOW_RUN_COLUMNS = (
+    ("liquidity_at_run", "REAL"),
 )
 
 COLLECTOR_COLUMNS = (
@@ -532,6 +540,9 @@ class Database:
             self._migrate_columns(connection, "forecasts", FORECAST_COLUMNS)
             self._migrate_columns(connection, "paper_positions", POSITION_COLUMNS)
             self._migrate_columns(connection, "paper_trades", TRADE_COLUMNS)
+            self._migrate_columns(
+                connection, "shadow_panel_runs", SHADOW_RUN_COLUMNS
+            )
             connection.execute(
                 """
                 UPDATE matches
@@ -564,7 +575,7 @@ class Database:
                 )
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
-                ("schema_version", "7"),
+                ("schema_version", "8"),
             )
 
     @staticmethod
@@ -1926,6 +1937,64 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def shadow_scoring_rows(self) -> List[Dict[str, Any]]:
+        """Resolved matches that carry a shadow consensus and its baseline.
+
+        ``liquidity_at_run`` is preferred over the match's current liquidity,
+        which drifts after the panel ran; older rows predate that column and
+        fall back, so ``liquidity_is_current`` marks which reading was used.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    r.run_id, r.match_id, r.model, r.backend, r.panel_version,
+                    r.status, r.successful_members,
+                    r.consensus_probability_a, r.market_probability_a,
+                    r.probability_spread,
+                    COALESCE(r.liquidity_at_run, m.liquidity) AS liquidity,
+                    r.liquidity_at_run IS NULL AS liquidity_is_current,
+                    m.team_a, m.team_b, m.winner, m.resolved_at
+                FROM shadow_panel_runs r
+                JOIN matches m ON m.match_id = r.match_id
+                WHERE m.status='resolved' AND m.winner IS NOT NULL
+                  AND r.consensus_probability_a IS NOT NULL
+                  AND r.market_probability_a IS NOT NULL
+                ORDER BY m.resolved_at ASC, r.run_id ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def shadow_member_rows(self) -> List[Dict[str, Any]]:
+        """Every successful member probability, for single-vs-median analysis."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_id, role, probability_a
+                FROM shadow_panel_members
+                WHERE status='completed' AND probability_a IS NOT NULL
+                ORDER BY run_id ASC, member_id ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def shadow_run_counts(self) -> Dict[str, int]:
+        with self.connect() as connection:
+            total = connection.execute(
+                "SELECT count(*) FROM shadow_panel_runs"
+            ).fetchone()[0]
+            scored = connection.execute(
+                """
+                SELECT count(*) FROM shadow_panel_runs r
+                JOIN matches m ON m.match_id = r.match_id
+                WHERE m.status='resolved' AND m.winner IS NOT NULL
+                  AND r.consensus_probability_a IS NOT NULL
+                  AND r.market_probability_a IS NOT NULL
+                """
+            ).fetchone()[0]
+        return {"total": int(total), "scored": int(scored),
+                "awaiting": int(total) - int(scored)}
+
     def begin_shadow_panel_run(
         self,
         match_id: str,
@@ -1935,6 +2004,7 @@ class Database:
         model: str,
         backend: str,
         grounded_teams: int,
+        liquidity: Optional[float] = None,
     ) -> Optional[int]:
         """Reserve one panel cohort, returning ``None`` on a concurrent claim."""
         with self.connect() as connection:
@@ -1942,8 +2012,9 @@ class Database:
                 """
                 INSERT OR IGNORE INTO shadow_panel_runs(
                     match_id, created_at, evidence_cutoff_at, panel_version,
-                    provider, model, backend, grounded_teams, applied
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    provider, model, backend, grounded_teams,
+                    liquidity_at_run, applied
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     match_id,
@@ -1954,6 +2025,7 @@ class Database:
                     model,
                     backend,
                     int(grounded_teams),
+                    None if liquidity is None else float(liquidity),
                 ),
             )
             return int(cursor.lastrowid) if cursor.rowcount else None
@@ -2923,10 +2995,17 @@ class Database:
             "collector": self.latest_collector_run(),
             "state_guard": self.state_rejection_summary(),
             "scoring": self.scoring_summary(),
+            "shadow": self.shadow_scoring_summary(),
             "matches": self.latest_rows(),
             "account": self.account_payload(account_name),
             "execution": self.execution_summary(account_name),
         }
+
+    def shadow_scoring_summary(self) -> Dict[str, Any]:
+        """Shadow-panel scoreboard. Imported lazily to keep storage leaf-level."""
+        from .scoring import shadow_score
+
+        return shadow_score(self)
 
     def scoring_summary(self) -> Dict[str, Any]:
         """Scoreboard for the dashboard. Imported lazily to keep storage leaf-level."""

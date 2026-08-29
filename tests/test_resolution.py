@@ -399,21 +399,52 @@ class ScoringTests(unittest.TestCase):
         self.assertAlmostEqual(brier(0.7, 0), 0.49)
         self.assertGreater(log_loss(0.01, 1), log_loss(0.4, 1))
 
-    def test_a_sharper_ai_beats_the_market(self):
+    def test_a_sharper_ai_scores_better_but_two_matches_earn_no_verdict(self):
         self._priced_match("m1", ai=0.9, market=0.6, winner="A")
         self._priced_match("m2", ai=0.1, market=0.4, winner="B")
         report = score(self.db)
         self.assertEqual(report["ai"]["n"], 2)
         self.assertLess(report["ai"]["brier"], report["market"]["brier"])
-        self.assertEqual(report["verdict"], "AI ahead of the market")
         self.assertEqual(report["ai"]["accuracy"], 1.0)
+        # A lower Brier on two matches is arithmetic, not evidence.
+        self.assertEqual(report["verdict"], "too close to call")
+        self.assertFalse(report["comparison"]["significant"])
+        self.assertFalse(report["reliable"])
 
-    def test_a_confidently_wrong_ai_loses(self):
+    def test_a_confidently_wrong_ai_loses_but_one_match_earns_no_verdict(self):
         self._priced_match("m1", ai=0.95, market=0.5, winner="B")
         report = score(self.db)
         self.assertGreater(report["ai"]["brier"], report["market"]["brier"])
-        self.assertEqual(report["verdict"], "market ahead of the AI")
         self.assertFalse(report["ai_beats_coin_flip"])
+        self.assertEqual(report["verdict"], "too close to call")
+        self.assertIsNone(report["comparison"]["ci_low"])
+
+    def test_a_consistent_lead_earns_a_verdict_once_the_interval_clears_zero(self):
+        # Twelve matches where the AI is steadily sharper than a fixed price.
+        for index in range(12):
+            self._priced_match(
+                "m%d" % index, ai=0.75 + 0.01 * index, market=0.55, winner="A"
+            )
+        report = score(self.db)
+        comparison = report["comparison"]
+        self.assertEqual(comparison["n"], 12)
+        self.assertLess(comparison["ci_high"], 0.0)
+        self.assertTrue(comparison["significant"])
+        self.assertEqual(report["verdict"], "AI ahead of the market")
+        self.assertTrue(report["reliable"])
+
+    def test_a_real_but_unproven_edge_reports_the_sample_it_would_need(self):
+        # Same direction every time, but swamped by one large opposite result.
+        for index in range(10):
+            self._priced_match("m%d" % index, ai=0.55, market=0.5, winner="A")
+        self._priced_match("loud", ai=0.05, market=0.5, winner="A")
+        report = score(self.db)
+        comparison = report["comparison"]
+        self.assertFalse(comparison["significant"])
+        self.assertEqual(report["verdict"], "too close to call")
+        self.assertLess(comparison["ci_low"], 0.0)
+        self.assertGreater(comparison["ci_high"], 0.0)
+        self.assertGreater(comparison["matches_needed"], comparison["n"])
 
     def test_small_samples_are_flagged_unreliable(self):
         self._priced_match("m1", ai=0.9, market=0.6, winner="A")

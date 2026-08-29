@@ -292,6 +292,7 @@ def run_shadow_panels(
             model=model,
             backend=adapter,
             grounded_teams=grounded,
+            liquidity=row.get("liquidity"),
         )
         if run_id is None:
             continue

@@ -24,7 +24,7 @@ from .pandascore import PandaScoreClient
 from .polymarket import PolymarketBookClient
 from .priors import run_priors
 from .resolver import resolve_open_matches
-from .scoring import score
+from .scoring import score, shadow_score
 from .shadow_panel import run_shadow_panels
 from .storage import Database
 from .timeutil import isoformat, parse_timestamp, utc_now
@@ -611,6 +611,9 @@ def cmd_score(args: argparse.Namespace) -> None:
     report = score(database)
     if args.summary:
         report.pop("matches", None)
+    # The shadow cohort answers a different question from the production
+    # prior's, so it is reported beside it rather than merged into it.
+    report["shadow"] = shadow_score(database)
     _print(report)
 
 

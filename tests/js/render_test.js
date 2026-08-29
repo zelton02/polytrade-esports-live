@@ -297,7 +297,7 @@ const tests = {
     assert.ok(!card.classList.contains("moved"), "an unchanged poll must stay dark");
   },
 
-  "scoreboard names the winner and flags a small sample"() {
+  "scoreboard crowns nobody while the interval still spans zero"() {
     const { context, document } = boot();
     const data = payload([match()]);
     data.scoring = {
@@ -305,16 +305,26 @@ const tests = {
       market: { n: 4, brier: 0.24, log_loss: 0.63, accuracy: 0.5 },
       brier_edge: 0.06, reliable: false, resolved_total: 4,
       missing_baseline: 0, ai_beats_coin_flip: true,
+      comparison: {
+        n: 4, ci_low: -0.12, ci_high: 0.24,
+        significant: false, matches_needed: 90,
+      },
     };
     context.render(data);
     const verdict = document.getElementById("verdict");
-    assert.ok(/AI AHEAD/.test(verdict.textContent), verdict.textContent);
-    assert.ok(verdict.className.indexOf("ahead") >= 0);
-    assert.strictEqual(document.getElementById("ai-brier").textContent, "0.180");
-    assert.ok(
-      /too small/.test(document.getElementById("caveat").textContent),
-      "a 4-match sample must be flagged"
+    assert.ok(/TOO CLOSE TO CALL/.test(verdict.textContent), verdict.textContent);
+    assert.strictEqual(
+      verdict.className.indexOf("ahead"), -1,
+      "a lower Brier alone must not crown the AI"
     );
+    assert.strictEqual(
+      document.getElementById("col-ai").className, "scorecol",
+      "no column may be marked the winner"
+    );
+    assert.strictEqual(document.getElementById("ai-brier").textContent, "0.180");
+    const caveat = document.getElementById("caveat").textContent;
+    assert.ok(/includes zero/.test(caveat), caveat);
+    assert.ok(/90 resolved matches/.test(caveat), caveat);
   },
 
   "scoreboard does not hide a losing model"() {

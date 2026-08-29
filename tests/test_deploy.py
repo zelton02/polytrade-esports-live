@@ -69,7 +69,7 @@ class DeploymentWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("a.name='execution-paper'", self.deploy_script)
         self.assertIn("wait for a clean v2 cohort cutover", self.deploy_script)
-        self.assertIn("schema_version is $SCHEMA_VERSION instead of 7", self.deploy_script)
+        self.assertIn("schema_version is $SCHEMA_VERSION instead of 8", self.deploy_script)
         self.assertIn("'execution-paper-v2'", self.deploy_script)
 
     def test_source_hash_ignores_python_bytecode(self):

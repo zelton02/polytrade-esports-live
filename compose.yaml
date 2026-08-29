@@ -176,9 +176,12 @@ services:
       - --daily-run-limit
       - "20"
       - --monthly-budget-usd
-      - "1.0"
+      - "5.0"
       - --max-cost-per-run
       - "0.02"
+      # Matches the priors worker: only books this deep can decide whether the
+      # panel should replace the production prior, and a shallower cohort would
+      # accumulate on its own separate question rather than speed this one up.
       - --min-liquidity
       - "20000"
       - --min-lead-minutes

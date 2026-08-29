@@ -660,9 +660,15 @@ function renderScoreboard(report) {
   document.getElementById("col-ai").className = "scorecol";
   document.getElementById("col-mkt").className = "scorecol";
 
+  var comparison = report.comparison || {};
   if (!n) {
     setClass(verdict, "verdict idle");
     setText(verdict, "AWAITING THE FIRST RESOLVED AI-PRICED MATCH");
+  } else if (!report.reliable) {
+    // A lower Brier is not a lead while the interval still spans zero, so no
+    // column is crowned here.
+    setClass(verdict, "verdict idle");
+    setText(verdict, "TOO CLOSE TO CALL \u2014 95% INTERVAL CROSSES ZERO");
   } else {
     var edge = report.brier_edge;
     var ahead = edge > 0;
@@ -677,7 +683,18 @@ function renderScoreboard(report) {
 
   var parts = [];
   if (n && !report.reliable) {
-    parts.push("n=" + n + " is far too small to mean anything; 30+ resolved matches before this is worth reading.");
+    var note = "n=" + n + " cannot separate the two";
+    if (comparison.ci_low !== null && comparison.ci_low !== undefined) {
+      note += ": the 95% interval on the per-match Brier difference runs " +
+        fixed3(comparison.ci_low) + " to " + fixed3(comparison.ci_high) +
+        " and includes zero";
+    }
+    note += ".";
+    if (comparison.matches_needed) {
+      note += " An effect this size would need about " +
+        comparison.matches_needed + " resolved matches.";
+    }
+    parts.push(note);
   }
   if (report.resolved_total) {
     parts.push(report.resolved_total + " resolved matches carry an AI prior.");

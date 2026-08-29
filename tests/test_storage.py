@@ -70,7 +70,7 @@ class StorageTests(unittest.TestCase):
             forecast_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(forecasts)")
             }
-        self.assertEqual(version, "7")
+        self.assertEqual(version, "8")
         self.assertTrue(
             {"paper_orders", "paper_fills", "order_book_levels",
              "execution_controls", "executor_status"}.issubset(tables)

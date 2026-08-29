@@ -13,6 +13,7 @@ from polytrade_esports.shadow_panel import (
     robust_consensus,
     run_shadow_panels,
 )
+from polytrade_esports.scoring import TRADEABLE_LIQUIDITY, shadow_score
 from polytrade_esports.storage import Database
 from polytrade_esports.timeutil import isoformat, utc_now
 from polytrade_esports.types import Match
@@ -272,3 +273,122 @@ class ShadowCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShadowScoringTests(unittest.TestCase):
+    """The cohort must be evaluable before three months of it accumulate."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Database(str(Path(self.temp.name) / "score.sqlite3"))
+        self.db.initialize()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _scored_run(
+        self, match_id, consensus, market, winner, liquidity,
+        members=(), model="deepseek-v4-pro", resolve=True,
+    ):
+        past = isoformat(utc_now() - timedelta(days=1))
+        self.db.add_match(
+            Match(match_id, "Alpha", "Bravo", 3, 0.5, scheduled_at=past)
+        )
+        run_id = self.db.begin_shadow_panel_run(
+            match_id=match_id,
+            evidence_cutoff_at=past,
+            panel_version=PANEL_VERSION,
+            provider="deepseek",
+            model=model,
+            backend="deepseek",
+            grounded_teams=2,
+            liquidity=liquidity,
+        )
+        for index, probability in enumerate(members):
+            self.db.record_shadow_panel_member(
+                run_id=run_id,
+                role=PANEL_ROLES[index].name,
+                prompt_sha256="%064d" % index,
+                parsed={
+                    "probability_team_a": probability,
+                    "confidence": "medium",
+                    "reasoning_summary": "r",
+                    "key_factors": [],
+                    "supporting_evidence": [],
+                    "assumptions": [],
+                    "usage": {},
+                    "raw_response": "{}",
+                },
+            )
+        self.db.finish_shadow_panel_run(
+            run_id=run_id,
+            status="completed",
+            consensus={
+                "probability_a": consensus,
+                "uncertainty_low_a": max(0.01, consensus - 0.05),
+                "uncertainty_high_a": min(0.99, consensus + 0.05),
+                "spread": 0.04,
+                "mad": 0.01,
+            },
+            market_probability_a=market,
+            market_captured_at=past,
+            usage={},
+            errors=[],
+        )
+        if resolve:
+            self.db.resolve_match(match_id, winner, isoformat(utc_now()))
+        return run_id
+
+    def test_liquidity_is_captured_at_run_time_not_read_back_later(self):
+        self._scored_run("m1", 0.6, 0.5, "A", liquidity=31000.0)
+        with self.db.connect() as connection:
+            stored = connection.execute(
+                "SELECT liquidity_at_run FROM shadow_panel_runs WHERE run_id=1"
+            ).fetchone()[0]
+            # The match's own liquidity moves after the panel ran; the run row
+            # must keep the depth the decision was actually made against.
+            connection.execute("UPDATE matches SET liquidity=100 WHERE match_id='m1'")
+        self.assertEqual(stored, 31000.0)
+        cohort = shadow_score(self.db)["cohorts"][0]
+        self.assertEqual(cohort["strata"][0]["band"], "tradeable")
+
+    def test_unresolved_runs_are_counted_but_never_scored(self):
+        self._scored_run("m1", 0.6, 0.5, "A", liquidity=30000.0, resolve=False)
+        report = shadow_score(self.db)
+        self.assertEqual(report["runs_total"], 1)
+        self.assertEqual(report["runs_scored"], 0)
+        self.assertEqual(report["runs_awaiting_result"], 1)
+        self.assertEqual(report["cohorts"], [])
+
+    def test_a_short_cohort_reports_no_winner(self):
+        self._scored_run("m1", 0.9, 0.5, "A", liquidity=30000.0)
+        self._scored_run("m2", 0.9, 0.5, "A", liquidity=30000.0)
+        cohort = shadow_score(self.db)["cohorts"][0]
+        self.assertLess(cohort["panel"]["brier"], cohort["market"]["brier"])
+        self.assertEqual(cohort["verdict"], "too close to call")
+        self.assertFalse(cohort["comparison"]["significant"])
+
+    def test_thin_and_tradeable_books_are_scored_separately(self):
+        self._scored_run("deep", 0.6, 0.5, "A", liquidity=TRADEABLE_LIQUIDITY + 1)
+        self._scored_run("thin", 0.6, 0.5, "A", liquidity=TRADEABLE_LIQUIDITY - 1)
+        strata = {s["band"]: s for s in shadow_score(self.db)["cohorts"][0]["strata"]}
+        self.assertEqual(strata["tradeable"]["n"], 1)
+        self.assertEqual(strata["thin"]["n"], 1)
+
+    def test_each_model_is_its_own_cohort(self):
+        self._scored_run("m1", 0.6, 0.5, "A", liquidity=30000.0, model="pro")
+        self._scored_run("m1b", 0.7, 0.5, "A", liquidity=30000.0, model="flash")
+        models = {c["model"] for c in shadow_score(self.db)["cohorts"]}
+        self.assertEqual(models, {"pro", "flash"})
+
+    def test_every_member_is_scored_against_the_median_it_fed(self):
+        # base-rate is wildly wrong; the median must look better than it.
+        self._scored_run(
+            "m1", 0.6, 0.5, "A", liquidity=30000.0,
+            members=(0.62, 0.58, 0.05, 0.60),
+        )
+        roles = {r["role"]: r for r in shadow_score(self.db)["cohorts"][0]["roles"]}
+        self.assertEqual(len(roles), 4)
+        self.assertGreater(roles["base-rate"]["brier"], roles["team-a-case"]["brier"])
+        # The single-vs-median question must be answerable per role.
+        self.assertIn("vs_panel", roles["base-rate"])
