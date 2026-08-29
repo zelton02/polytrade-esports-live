@@ -1937,6 +1937,49 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def shadow_panel_for_match(self, match_id: str) -> List[Dict[str, Any]]:
+        """Panel runs for one match, newest first, each with its members.
+
+        Normally one row. A second appears only when the worker's model changed
+        while the fixture was still upcoming, which re-opens the per-model
+        queue -- so the caller must render a list, not the first row.
+        """
+        with self.connect() as connection:
+            runs = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT run_id, model, status, successful_members,
+                           consensus_probability_a, market_probability_a,
+                           probability_spread, created_at
+                    FROM shadow_panel_runs
+                    WHERE match_id=? AND consensus_probability_a IS NOT NULL
+                    ORDER BY created_at DESC, run_id DESC
+                    """,
+                    (match_id,),
+                ).fetchall()
+            ]
+            if not runs:
+                return []
+            identifiers = [int(run["run_id"]) for run in runs]
+            placeholders = ",".join("?" * len(identifiers))
+            members = connection.execute(
+                """
+                SELECT run_id, role, probability_a, confidence
+                FROM shadow_panel_members
+                WHERE status='completed' AND probability_a IS NOT NULL
+                  AND run_id IN (%s)
+                ORDER BY member_id ASC
+                """ % placeholders,
+                identifiers,
+            ).fetchall()
+        grouped: Dict[int, List[Dict[str, Any]]] = {}
+        for member in members:
+            grouped.setdefault(int(member["run_id"]), []).append(dict(member))
+        for run in runs:
+            run["members"] = grouped.get(int(run["run_id"]), [])
+        return runs
+
     def shadow_scoring_rows(self) -> List[Dict[str, Any]]:
         """Resolved matches that carry a shadow consensus and its baseline.
 
@@ -2569,6 +2612,7 @@ class Database:
                 match_id, prior["created_at"]
             )
         detail["prior"] = prior
+        detail["shadow"] = self.shadow_panel_for_match(match_id)
         latest = dict(detail["history"][-1]) if detail["history"] else {}
         if latest_state is not None:
             latest.update(dict(latest_state))

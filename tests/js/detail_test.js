@@ -113,6 +113,64 @@ const tests = {
     assert.strictEqual(marks.length, 1, "exactly one map change should be marked");
   },
 
+  "the panel shows its members and says it never trades"() {
+    const { context, document } = boot();
+    context.render(detail({
+      shadow: [{
+        run_id: 2, model: "deepseek-v4-pro", status: "completed",
+        consensus_probability_a: 0.49, market_probability_a: 0.425,
+        members: [
+          { role: "team-a-case", probability_a: 0.48 },
+          { role: "team-b-case", probability_a: 0.48 },
+          { role: "base-rate", probability_a: 0.5 },
+          { role: "skeptic-auditor", probability_a: 0.5 },
+        ],
+      }],
+    }));
+    const text = document.getElementById("d-panel").textContent;
+    assert.ok(/PANEL WIN PROBABILITY/.test(text), text);
+    assert.ok(/49\.0%/.test(text), text);
+    assert.ok(/42\.5%/.test(text), text);
+    assert.ok(/base-rate/.test(text), text);
+    assert.ok(/skeptic-auditor/.test(text), text);
+    assert.ok(/never traded/.test(text), text);
+  },
+
+  "every panel run is shown, not just the newest"() {
+    // Two runs appear when the worker's model changed while the fixture was
+    // still upcoming; rendering only the first would silently drop one.
+    const { context, document } = boot();
+    context.render(detail({
+      shadow: [
+        { run_id: 2, model: "deepseek-v4-pro", consensus_probability_a: 0.49,
+          market_probability_a: 0.425, members: [] },
+        { run_id: 1, model: "deepseek-v4-flash", consensus_probability_a: 0.49,
+          market_probability_a: 0.405, members: [] },
+      ],
+    }));
+    const text = document.getElementById("d-panel").textContent;
+    assert.ok(/deepseek-v4-pro/.test(text), text);
+    assert.ok(/deepseek-v4-flash/.test(text), text);
+  },
+
+  "a match with no panel explains why rather than showing a dash"() {
+    const { context, document } = boot();
+    context.render(detail({ shadow: [] }));
+    const text = document.getElementById("d-panel").textContent;
+    assert.ok(/No market-blind panel ran/.test(text), text);
+    assert.ok(/deepest books/.test(text), text);
+  },
+
+  "a panel with no recorded price says so instead of inventing one"() {
+    const { context, document } = boot();
+    context.render(detail({
+      shadow: [{ model: "deepseek-v4-pro", consensus_probability_a: 0.49,
+                 market_probability_a: null, members: [] }],
+    }));
+    const text = document.getElementById("d-panel").textContent;
+    assert.ok(/not recorded/.test(text), text);
+  },
+
   "an unscoreable prior says so instead of hiding it"() {
     const { context, document } = boot();
     const d = detail();

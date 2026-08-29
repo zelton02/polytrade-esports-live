@@ -339,6 +339,63 @@ class ShadowScoringTests(unittest.TestCase):
             self.db.resolve_match(match_id, winner, isoformat(utc_now()))
         return run_id
 
+    def test_match_detail_carries_every_panel_run_with_its_members(self):
+        self._scored_run(
+            "m1", 0.49, 0.425, "A", liquidity=31000.0,
+            members=(0.48, 0.48, 0.50, 0.50), model="deepseek-v4-pro",
+        )
+        runs = self.db.shadow_panel_for_match("m1")
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["model"], "deepseek-v4-pro")
+        self.assertAlmostEqual(runs[0]["consensus_probability_a"], 0.49)
+        self.assertAlmostEqual(runs[0]["market_probability_a"], 0.425)
+        roles = [member["role"] for member in runs[0]["members"]]
+        self.assertEqual(roles, [role.name for role in PANEL_ROLES])
+        detail = self.db.match_detail("m1")
+        self.assertEqual(detail["shadow"], runs)
+
+    def test_a_match_with_no_panel_reports_an_empty_list(self):
+        past = isoformat(utc_now() - timedelta(days=1))
+        self.db.add_match(Match("bare", "Alpha", "Bravo", 3, 0.5, scheduled_at=past))
+        self.assertEqual(self.db.shadow_panel_for_match("bare"), [])
+        self.assertEqual(self.db.match_detail("bare")["shadow"], [])
+
+    def test_members_are_never_attached_to_another_run(self):
+        # Two runs on one match happen when the model changes mid-fixture.
+        self._scored_run(
+            "m1", 0.49, 0.425, "A", liquidity=31000.0,
+            members=(0.48, 0.48, 0.50, 0.50), model="deepseek-v4-pro",
+        )
+        run_id = self.db.begin_shadow_panel_run(
+            match_id="m1", evidence_cutoff_at=isoformat(utc_now()),
+            panel_version=PANEL_VERSION, provider="deepseek",
+            model="deepseek-v4-flash", backend="deepseek",
+            grounded_teams=2, liquidity=31000.0,
+        )
+        self.db.record_shadow_panel_member(
+            run_id=run_id, role=PANEL_ROLES[0].name, prompt_sha256="%064d" % 9,
+            parsed={
+                "probability_team_a": 0.53, "confidence": "low",
+                "reasoning_summary": "r", "key_factors": [],
+                "supporting_evidence": [], "assumptions": [],
+                "usage": {}, "raw_response": "{}",
+            },
+        )
+        self.db.finish_shadow_panel_run(
+            run_id=run_id, status="partial",
+            consensus={"probability_a": 0.53, "uncertainty_low_a": 0.48,
+                       "uncertainty_high_a": 0.58, "spread": 0.0, "mad": 0.0},
+            market_probability_a=0.405, market_captured_at=isoformat(utc_now()),
+            usage={}, errors=[],
+        )
+        runs = {run["model"]: run for run in self.db.shadow_panel_for_match("m1")}
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(len(runs["deepseek-v4-pro"]["members"]), 4)
+        self.assertEqual(len(runs["deepseek-v4-flash"]["members"]), 1)
+        self.assertAlmostEqual(
+            runs["deepseek-v4-flash"]["members"][0]["probability_a"], 0.53
+        )
+
     def test_liquidity_is_captured_at_run_time_not_read_back_later(self):
         self._scored_run("m1", 0.6, 0.5, "A", liquidity=31000.0)
         with self.db.connect() as connection:

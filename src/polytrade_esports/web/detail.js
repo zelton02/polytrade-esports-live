@@ -240,6 +240,50 @@ function renderAi(detail) {
    whose evidence was not retained, and a prior with its evidence. Collapsing
    the middle case into the first told the reader "no prior was written" on a
    page that was displaying the prior directly above. */
+function renderShadow(detail) {
+  var host = document.getElementById("d-panel");
+  host.textContent = "";
+  var runs = detail.shadow || [];
+  if (!runs.length) {
+    host.appendChild(
+      el("div", "hint",
+        "No market-blind panel ran for this match. Panels are limited to the deepest books, need team facts already cached, and will not start inside ten minutes of scheduled start.")
+    );
+    return;
+  }
+  runs.forEach(function (run) {
+    host.appendChild(
+      // Model first: a fixture carries a second run when the worker's model
+      // changed mid-fixture, and each block has to announce which one it is.
+      kv([
+        ["MODEL", run.model || "\u2014"],
+        ["PANEL WIN PROBABILITY",
+          pct(run.consensus_probability_a) + " " + detail.team_a],
+        ["MARKET THEN",
+          run.market_probability_a === null || run.market_probability_a === undefined
+            ? "not recorded"
+            : pct(run.market_probability_a)],
+      ])
+    );
+    var members = run.members || [];
+    if (members.length) {
+      var list = el("ul", "factors");
+      members.forEach(function (member) {
+        list.appendChild(
+          el("li", null, member.role + " \u00b7 " + pct(member.probability_a))
+        );
+      });
+      host.appendChild(list);
+    }
+  });
+  // The four members never see the price, each other, or the production
+  // prior; nothing here is ever priced or traded.
+  host.appendChild(
+    el("div", "hint",
+      "Four independent members, each blind to the market and to each other. The panel win probability is the median of their estimates. Recorded for comparison only \u2014 never priced, never traded.")
+  );
+}
+
 function renderFacts(detail) {
   var host = document.getElementById("d-facts");
   host.textContent = "";
@@ -495,6 +539,7 @@ function render(detail) {
   setText(document.getElementById("d-points"), "[" + (detail.history || []).length + "]");
   drawChart(detail.history || []);
   renderAi(detail);
+  renderShadow(detail);
   renderFacts(detail);
   renderBook(detail);
   renderPaper(detail);
