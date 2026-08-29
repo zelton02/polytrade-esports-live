@@ -46,6 +46,20 @@ class EnginePaperTests(unittest.TestCase):
         self.assertEqual(cohort["trades"], 1)
         self.assertEqual(cohort["open_positions"], 1)
 
+    def test_unpriced_forecast_does_not_inflate_strategy_decisions(self):
+        state = LiveState("m1", STAMP, 0, 0, 4, 2, observed_at=STAMP)
+        quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        tick(
+            self.db, state, quote, strategy="round-live",
+            paper_enabled=False, entry_enabled=False,
+        )
+        cohort = next(
+            item for item in self.db.strategy_summary()
+            if item["strategy"] == "round-live"
+        )
+        self.assertEqual(cohort["decisions"], 0)
+        self.assertEqual(cohort["trades"], 0)
+
     def test_no_entry_without_required_edge(self):
         self.db.add_match(Match("m2", "C", "D", 3, 0.50))
         state = LiveState("m2", STAMP, 0, 0, 0, 0, observed_at=STAMP)

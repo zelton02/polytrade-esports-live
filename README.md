@@ -220,8 +220,10 @@ Strategy labels describe the information horizon used for each decision:
 | `round-live` | Live decision from an accepted round-level snapshot |
 
 Paper positions keep their opening strategy even if a later horizon reduces or
-settles them. The dashboard reports decisions and trades by decision horizon,
-while realized/open PnL is attributed to the strategy that opened the exposure.
+settles them. The dashboard reports grounded-paper-eligible decisions and trades
+by decision horizon, while realized/open PnL is attributed to the strategy that
+opened the exposure. Forecasts written before this eligibility flag existed are
+kept for audit but excluded from decision counts rather than guessed into them.
 
 ## Known follow-ups
 

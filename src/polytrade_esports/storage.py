@@ -94,6 +94,8 @@ CREATE TABLE IF NOT EXISTS forecasts (
     edge_b REAL NOT NULL,
     best_side TEXT CHECK (best_side IN ('A', 'B') OR best_side IS NULL),
     strategy TEXT NOT NULL DEFAULT 'pre-match',
+    paper_enabled INTEGER NOT NULL DEFAULT 0,
+    entry_enabled INTEGER NOT NULL DEFAULT 0,
     breakdown_json TEXT NOT NULL,
     UNIQUE (state_id, book_id, model_version)
 );
@@ -241,6 +243,11 @@ COLLECTOR_COLUMNS = (
 
 FORECAST_COLUMNS = (
     ("strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
+    # Added after strategy attribution shipped. Legacy forecasts cannot be
+    # proven eligible for the grounded paper cohort, so they default false and
+    # are excluded from decision counts instead of inflating them.
+    ("paper_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("entry_enabled", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 POSITION_COLUMNS = (
@@ -353,7 +360,7 @@ class Database:
                 self._backfill_strategy_attribution(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
-                ("schema_version", "4"),
+                ("schema_version", "5"),
             )
 
     @staticmethod
@@ -798,6 +805,8 @@ class Database:
         best_side: Optional[str],
         breakdown: Dict[str, Any],
         strategy: str = "pre-match",
+        paper_enabled: bool = False,
+        entry_enabled: bool = False,
     ) -> int:
         strategy = validate_strategy(strategy)
         with self.connect() as connection:
@@ -806,8 +815,9 @@ class Database:
                 INSERT OR IGNORE INTO forecasts(
                     match_id, state_id, book_id, forecast_at, model_version,
                     probability_a, market_midpoint_a, edge_a, edge_b,
-                    best_side, breakdown_json, strategy
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    best_side, breakdown_json, strategy, paper_enabled,
+                    entry_enabled
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     match_id,
@@ -822,6 +832,8 @@ class Database:
                     best_side,
                     _json(breakdown),
                     strategy,
+                    int(bool(paper_enabled)),
+                    int(bool(entry_enabled)),
                 ),
             )
             row = connection.execute(
@@ -1678,7 +1690,10 @@ class Database:
         }
         with self.connect() as connection:
             for row in connection.execute(
-                "SELECT strategy, count(*) AS n FROM forecasts GROUP BY strategy"
+                """
+                SELECT strategy, count(*) AS n FROM forecasts
+                WHERE paper_enabled=1 GROUP BY strategy
+                """
             ).fetchall():
                 if row["strategy"] in summary:
                     summary[row["strategy"]]["decisions"] = int(row["n"])

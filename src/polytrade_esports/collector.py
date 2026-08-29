@@ -366,7 +366,7 @@ def run_cycle(
                 result.notices.append(
                     "%s: canonical state rejected (%s)" % (match_id, decision.reason)
                 )
-            if decision.frozen:
+            if live and decision.frozen:
                 result.feed_health["frozen_states"] += 1
             if live:
                 if candidate_state.source == SPORTS_MAPS_ONLY_SOURCE:

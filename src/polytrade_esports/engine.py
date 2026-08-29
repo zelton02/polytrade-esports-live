@@ -56,6 +56,8 @@ def tick(
         best_side=best_side,
         breakdown=breakdown.to_dict(),
         strategy=strategy,
+        paper_enabled=paper_enabled,
+        entry_enabled=paper_enabled and entry_enabled,
     )
     # Drift since our own view last had reason to change.
     anchor_market = database.market_at_last_state_change(
