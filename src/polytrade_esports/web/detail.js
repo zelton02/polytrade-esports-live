@@ -309,8 +309,10 @@ function renderPaper(detail) {
   host.textContent = "";
   var open = (detail.positions || []).filter(function (p) { return Number(p.shares) > 0; });
   var trades = detail.trades || [];
+  var orders = detail.orders || [];
+  var fills = detail.fills || [];
 
-  if (!open.length && !trades.length) {
+  if (!open.length && !trades.length && !orders.length) {
     var why = detail.prior_source && detail.prior_source !== "seed"
       ? "No position. The edge has not cleared the entry threshold."
       : "No position, and none is possible: without an AI prior the model sits at the neutral seed, and the paper engine stands down rather than trade on the absence of a view.";
@@ -325,12 +327,64 @@ function renderPaper(detail) {
         ["SHARES", Number(p.shares).toFixed(3)],
         ["AVG COST", pct(p.avg_cost)],
         ["ENTRY STRATEGY", String(p.entry_strategy || "—").toUpperCase()],
+        ["EXECUTION", String(p.execution_mode || "legacy").toUpperCase()],
+        ["FEES PAID", money(p.fees_paid || 0)],
         ["REALIZED", money(p.realized_pnl)],
       ])
     );
   });
 
+  if (orders.length) {
+    host.appendChild(el(
+      "div", "hint",
+      orders.length + " ORDERS · " + fills.length + " RECORDED DEPTH FILLS"
+    ));
+    var orderTable = el("table");
+    var orderHead = el("thead");
+    var orderHeadRow = el("tr");
+    ["SIGNAL", "STRATEGY", "STATUS", "ACT", "SIDE", "REQUEST", "FILLED", "SIGNAL PX", "FILL PX", "SLIP", "FEE", "LATENCY", "REASON"]
+      .forEach(function (h) { orderHeadRow.appendChild(el("th", null, h)); });
+    orderHead.appendChild(orderHeadRow);
+    orderTable.appendChild(orderHead);
+    var orderBody = el("tbody");
+    orders.forEach(function (o) {
+      var row = el("tr");
+      var filled = Number(o.filled_shares || 0);
+      var average = Number(o.avg_fill_price || 0);
+      var signal = Number(o.signal_price || 0);
+      var slippage = filled > 0
+        ? (o.action === "BUY" ? average - signal : signal - average)
+        : null;
+      var latency = o.completed_at
+        ? Math.max(0, new Date(o.completed_at).getTime() - new Date(o.signal_at).getTime())
+        : null;
+      row.appendChild(el("td", null, clock(o.signal_at)));
+      row.appendChild(el("td", null, String(o.decision_strategy || "—").toUpperCase()));
+      row.appendChild(el("td", null, o.status));
+      row.appendChild(el("td", o.action === "BUY" ? "buy" : "sell", o.action));
+      row.appendChild(el("td", null, o.outcome === "A" ? detail.team_a : detail.team_b));
+      row.appendChild(el("td", "num", Number(o.requested_shares).toFixed(3)));
+      row.appendChild(el("td", "num", filled.toFixed(3)));
+      row.appendChild(el("td", "num", pct(signal)));
+      row.appendChild(el("td", "num", filled > 0 ? pct(average) : "—"));
+      row.appendChild(el(
+        "td",
+        "num " + (slippage === null ? "flat" : slippage > 0 ? "down" : slippage < 0 ? "up" : "flat"),
+        signedPct(slippage)
+      ));
+      row.appendChild(el("td", "num", money(o.fee_paid || 0)));
+      row.appendChild(el("td", "num", latency === null ? "—" : Math.round(latency) + "ms"));
+      row.appendChild(el("td", null, o.rejection_reason || o.reason));
+      orderBody.appendChild(row);
+    });
+    orderTable.appendChild(orderBody);
+    var orderScroller = el("div", "scroller");
+    orderScroller.appendChild(orderTable);
+    host.appendChild(orderScroller);
+  }
+
   if (trades.length) {
+    host.appendChild(el("div", "hint", "FILL / SETTLEMENT JOURNAL"));
     var table = el("table");
     var head = el("thead");
     var headRow = el("tr");

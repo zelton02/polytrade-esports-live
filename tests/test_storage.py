@@ -56,6 +56,27 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(report["total"], 1)
         self.assertEqual(report["recent"][0]["reason"], "same_map_round_score_regressed")
 
+    def test_execution_schema_is_versioned_and_migratable(self):
+        with self.db.connect() as connection:
+            version = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0]
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            forecast_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(forecasts)")
+            }
+        self.assertEqual(version, "6")
+        self.assertTrue(
+            {"paper_orders", "paper_fills", "order_book_levels",
+             "execution_controls", "executor_status"}.issubset(tables)
+        )
+        self.assertIn("execution_mode", forecast_columns)
+
 
 if __name__ == "__main__":
     unittest.main()

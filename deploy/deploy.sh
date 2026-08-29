@@ -49,7 +49,7 @@ if [ "$CONTAINER_SOURCE_SHA" != "$SOURCE_SHA" ]; then
     echo "DEPLOY FAILED: container source $CONTAINER_SOURCE_SHA != local $SOURCE_SHA" >&2
     exit 1
 fi
-for ASSET in app.css detail.html detail.js; do
+for ASSET in index.html app.js app.css detail.html detail.js; do
     CONTAINER_SHA="$(docker exec "$DASHBOARD_ID" \
         sha256sum "/app/src/polytrade_esports/web/$ASSET" | cut -c1-12)"
     LOCAL_SHA="$(sha256sum "src/polytrade_esports/web/$ASSET" | cut -c1-12)"

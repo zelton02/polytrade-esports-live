@@ -11,6 +11,9 @@ from .types import BookQuote, LiveState, Match
 from .state_guard import STRATEGIES, validate_strategy
 
 
+EXECUTION_MODES = ("legacy", "depth-sim")
+
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -215,6 +218,112 @@ CREATE TABLE IF NOT EXISTS team_facts (
 );
 """
 
+# Final paper-execution ledger.  The old paper_trades table remains as the
+# compact position/PnL journal and is explicitly labelled ``legacy`` during
+# migration.  New decisions first become orders, then one or more immutable
+# fills; only those fills are materialized into paper_trades and positions.
+SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS order_book_levels (
+    level_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id INTEGER NOT NULL REFERENCES market_snapshots(book_id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL CHECK (outcome IN ('A', 'B')),
+    side TEXT NOT NULL CHECK (side IN ('BID', 'ASK')),
+    level_index INTEGER NOT NULL,
+    price REAL NOT NULL CHECK (price > 0 AND price < 1),
+    size REAL NOT NULL CHECK (size > 0),
+    UNIQUE(book_id, outcome, side, level_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_book_levels_book
+ON order_book_levels(book_id, outcome, side, level_index);
+
+CREATE TABLE IF NOT EXISTS paper_orders (
+    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_order_id TEXT NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL REFERENCES paper_accounts(account_id),
+    match_id TEXT NOT NULL REFERENCES matches(match_id),
+    forecast_id INTEGER NOT NULL REFERENCES forecasts(forecast_id),
+    execution_mode TEXT NOT NULL DEFAULT 'depth-sim'
+        CHECK (execution_mode IN ('depth-sim')),
+    decision_strategy TEXT NOT NULL DEFAULT 'pre-match',
+    entry_strategy TEXT NOT NULL DEFAULT 'pre-match',
+    action TEXT NOT NULL CHECK (action IN ('BUY', 'SELL')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('A', 'B')),
+    order_type TEXT NOT NULL DEFAULT 'IOC' CHECK (order_type IN ('IOC')),
+    requested_shares REAL NOT NULL CHECK (requested_shares > 0),
+    signal_price REAL NOT NULL CHECK (signal_price > 0 AND signal_price < 1),
+    limit_price REAL NOT NULL CHECK (limit_price > 0 AND limit_price < 1),
+    signal_at TEXT NOT NULL,
+    execute_after TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    submitted_at TEXT,
+    completed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN (
+            'PENDING', 'SUBMITTED', 'PARTIALLY_FILLED', 'FILLED',
+            'REJECTED', 'EXPIRED', 'CANCELLED'
+        )),
+    filled_shares REAL NOT NULL DEFAULT 0,
+    avg_fill_price REAL NOT NULL DEFAULT 0,
+    fee_paid REAL NOT NULL DEFAULT 0,
+    cash_delta REAL NOT NULL DEFAULT 0,
+    realized_pnl REAL NOT NULL DEFAULT 0,
+    execution_book_id INTEGER REFERENCES market_snapshots(book_id),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    rejection_reason TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_orders_due
+ON paper_orders(status, execute_after, order_id);
+
+CREATE INDEX IF NOT EXISTS idx_paper_orders_account_match
+ON paper_orders(account_id, match_id, order_id);
+
+CREATE TABLE IF NOT EXISTS paper_fills (
+    fill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES paper_orders(order_id),
+    book_id INTEGER NOT NULL REFERENCES market_snapshots(book_id),
+    level_index INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('BUY', 'SELL')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('A', 'B')),
+    shares REAL NOT NULL CHECK (shares > 0),
+    price REAL NOT NULL CHECK (price > 0 AND price < 1),
+    notional REAL NOT NULL CHECK (notional > 0),
+    fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
+    liquidity TEXT NOT NULL DEFAULT 'TAKER' CHECK (liquidity IN ('TAKER')),
+    filled_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_fills_order
+ON paper_fills(order_id, fill_id);
+
+CREATE TABLE IF NOT EXISTS execution_controls (
+    account_id INTEGER PRIMARY KEY REFERENCES paper_accounts(account_id),
+    kill_switch INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS executor_status (
+    singleton INTEGER PRIMARY KEY CHECK (singleton=1),
+    worker_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'starting',
+    last_heartbeat_at TEXT,
+    last_order_at TEXT,
+    processed INTEGER NOT NULL DEFAULT 0,
+    filled INTEGER NOT NULL DEFAULT 0,
+    partial INTEGER NOT NULL DEFAULT 0,
+    rejected INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '{}'
+);
+"""
+
 # The market's own probability at the instant the prior was made. Scoring the
 # AI against a price sampled at some other moment is not a fair comparison.
 PRIOR_COLUMNS = (
@@ -241,6 +350,10 @@ COLLECTOR_COLUMNS = (
     ("feed_status_json", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
+BOOK_COLUMNS = (
+    ("depth_available", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 FORECAST_COLUMNS = (
     ("strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
     # Added after strategy attribution shipped. Legacy forecasts cannot be
@@ -248,15 +361,24 @@ FORECAST_COLUMNS = (
     # are excluded from decision counts instead of inflating them.
     ("paper_enabled", "INTEGER NOT NULL DEFAULT 0"),
     ("entry_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("execution_mode", "TEXT NOT NULL DEFAULT 'legacy'"),
 )
 
 POSITION_COLUMNS = (
     ("entry_strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
+    ("execution_mode", "TEXT NOT NULL DEFAULT 'legacy'"),
+    ("fees_paid", "REAL NOT NULL DEFAULT 0"),
 )
 
 TRADE_COLUMNS = (
     ("decision_strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
     ("entry_strategy", "TEXT NOT NULL DEFAULT 'pre-match'"),
+    ("execution_mode", "TEXT NOT NULL DEFAULT 'legacy'"),
+    ("order_id", "INTEGER"),
+    ("fee", "REAL NOT NULL DEFAULT 0"),
+    ("slippage", "REAL NOT NULL DEFAULT 0"),
+    ("signal_price", "REAL"),
+    ("fill_latency_ms", "REAL NOT NULL DEFAULT 0"),
 )
 
 # Esports start times slip routinely; a prior written just after the scheduled
@@ -328,6 +450,7 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             connection.executescript(SCHEMA_V2)
+            connection.executescript(SCHEMA_V6)
             version_row = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
@@ -335,6 +458,7 @@ class Database:
             self._migrate_columns(connection, "matches", MATCH_COLUMNS)
             self._migrate_columns(connection, "llm_priors", PRIOR_COLUMNS)
             self._migrate_columns(connection, "collector_runs", COLLECTOR_COLUMNS)
+            self._migrate_columns(connection, "market_snapshots", BOOK_COLUMNS)
             self._migrate_columns(connection, "forecasts", FORECAST_COLUMNS)
             self._migrate_columns(connection, "paper_positions", POSITION_COLUMNS)
             self._migrate_columns(connection, "paper_trades", TRADE_COLUMNS)
@@ -360,7 +484,7 @@ class Database:
                 self._backfill_strategy_attribution(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
-                ("schema_version", "5"),
+                ("schema_version", "6"),
             )
 
     @staticmethod
@@ -790,10 +914,16 @@ class Database:
             ).fetchall()
         return {"total": total, "recent": [dict(row) for row in recent]}
 
-    def record_book(self, quote: BookQuote) -> int:
+    def record_book(self, quote: BookQuote, store_depth: bool = False) -> int:
         normalized = quote.normalized()
         payload = normalized.to_dict()
         digest = _sha(payload)
+        depth = {
+            (outcome, side): normalized.levels(outcome, side)
+            for outcome in ("A", "B")
+            for side in ("bids", "asks")
+        }
+        depth_available = all(depth.values())
         with self.connect() as connection:
             connection.execute(
                 """
@@ -823,7 +953,36 @@ class Database:
                 """,
                 (normalized.match_id, normalized.source, normalized.source_at, digest),
             ).fetchone()
-        return int(row["book_id"])
+            book_id = int(row["book_id"])
+            # Forecast snapshots retain the provider payload for audit, but
+            # normalizing every level on every one-minute pricing tick would
+            # multiply the database by thousands of rows an hour.  The exact
+            # depth consumed by an execution is normalized here when the
+            # executor records its post-latency book.
+            if store_depth:
+                for (outcome, side), levels in depth.items():
+                    for index, level in enumerate(levels):
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO order_book_levels(
+                                book_id, outcome, side, level_index, price, size
+                            ) VALUES(?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                book_id,
+                                outcome,
+                                "BID" if side == "bids" else "ASK",
+                                index,
+                                level.price,
+                                level.size,
+                            ),
+                        )
+            if store_depth and depth_available:
+                connection.execute(
+                    "UPDATE market_snapshots SET depth_available=1 WHERE book_id=?",
+                    (book_id,),
+                )
+        return book_id
 
     def record_forecast(
         self,
@@ -841,8 +1000,11 @@ class Database:
         strategy: str = "pre-match",
         paper_enabled: bool = False,
         entry_enabled: bool = False,
+        execution_mode: str = "depth-sim",
     ) -> int:
         strategy = validate_strategy(strategy)
+        if execution_mode not in EXECUTION_MODES:
+            raise ValueError("invalid execution_mode: %s" % execution_mode)
         with self.connect() as connection:
             connection.execute(
                 """
@@ -850,8 +1012,8 @@ class Database:
                     match_id, state_id, book_id, forecast_at, model_version,
                     probability_a, market_midpoint_a, edge_a, edge_b,
                     best_side, breakdown_json, strategy, paper_enabled,
-                    entry_enabled
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    entry_enabled, execution_mode
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     match_id,
@@ -868,6 +1030,7 @@ class Database:
                     strategy,
                     int(bool(paper_enabled)),
                     int(bool(entry_enabled)),
+                    execution_mode,
                 ),
             )
             row = connection.execute(
@@ -895,6 +1058,308 @@ class Database:
                 "SELECT account_id FROM paper_accounts WHERE name=?", (name,)
             ).fetchone()
         return int(row["account_id"])
+
+    def create_paper_order(
+        self,
+        *,
+        client_order_id: str,
+        account_id: int,
+        match_id: str,
+        forecast_id: int,
+        decision_strategy: str,
+        entry_strategy: str,
+        action: str,
+        outcome: str,
+        requested_shares: float,
+        signal_price: float,
+        limit_price: float,
+        signal_at: str,
+        execute_after: str,
+        expires_at: str,
+        reason: str,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        decision_strategy = validate_strategy(decision_strategy)
+        entry_strategy = validate_strategy(entry_strategy)
+        action = str(action).upper()
+        outcome = str(outcome).upper()
+        if action not in ("BUY", "SELL"):
+            raise ValueError("paper order action must be BUY or SELL")
+        if outcome not in ("A", "B"):
+            raise ValueError("paper order outcome must be A or B")
+        shares = float(requested_shares)
+        signal = float(signal_price)
+        limit = float(limit_price)
+        if shares <= 0.0:
+            raise ValueError("paper order requested_shares must be positive")
+        if not 0.0 < signal < 1.0 or not 0.0 < limit < 1.0:
+            raise ValueError("paper order prices must be in (0, 1)")
+        signalled = canonical_timestamp(signal_at)
+        due = canonical_timestamp(execute_after)
+        expiry = canonical_timestamp(expires_at)
+        if parse_timestamp(due) < parse_timestamp(signalled):
+            raise ValueError("execute_after cannot precede signal_at")
+        if parse_timestamp(expiry) < parse_timestamp(due):
+            raise ValueError("expires_at cannot precede execute_after")
+        now = isoformat(utc_now())
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO paper_orders(
+                    client_order_id, account_id, match_id, forecast_id,
+                    decision_strategy, entry_strategy, action, outcome,
+                    requested_shares, signal_price, limit_price, signal_at,
+                    execute_after, expires_at, reason, config_json,
+                    created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    client_order_id,
+                    int(account_id),
+                    match_id,
+                    int(forecast_id),
+                    decision_strategy,
+                    entry_strategy,
+                    action,
+                    outcome,
+                    shares,
+                    signal,
+                    limit,
+                    signalled,
+                    due,
+                    expiry,
+                    str(reason),
+                    _json(config),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM paper_orders WHERE client_order_id=?",
+                (client_order_id,),
+            ).fetchone()
+        return dict(row)
+
+    def cancel_pending_orders(
+        self,
+        account_id: int,
+        match_id: str,
+        reason: str = "superseded",
+        except_forecast_id: Optional[int] = None,
+    ) -> int:
+        now = isoformat(utc_now())
+        with self.connect() as connection:
+            if except_forecast_id is None:
+                cursor = connection.execute(
+                    """
+                    UPDATE paper_orders
+                    SET status='CANCELLED', rejection_reason=?, completed_at=?, updated_at=?
+                    WHERE account_id=? AND match_id=? AND status='PENDING'
+                    """,
+                    (str(reason), now, now, int(account_id), match_id),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE paper_orders
+                    SET status='CANCELLED', rejection_reason=?, completed_at=?, updated_at=?
+                    WHERE account_id=? AND match_id=? AND status='PENDING'
+                      AND forecast_id<>?
+                    """,
+                    (
+                        str(reason), now, now, int(account_id), match_id,
+                        int(except_forecast_id),
+                    ),
+                )
+        return int(cursor.rowcount)
+
+    def due_order_ids(
+        self, account_name: str, due_at: str, limit: int = 50
+    ) -> List[int]:
+        due = canonical_timestamp(due_at)
+        with self.connect() as connection:
+            account = connection.execute(
+                "SELECT account_id FROM paper_accounts WHERE name=?", (account_name,)
+            ).fetchone()
+            if account is None:
+                return []
+            connection.execute(
+                """
+                UPDATE paper_orders
+                SET status='EXPIRED', rejection_reason='order_ttl_elapsed',
+                    completed_at=?, updated_at=?
+                WHERE account_id=? AND status='PENDING' AND expires_at < ?
+                """,
+                (due, due, int(account["account_id"]), due),
+            )
+            rows = connection.execute(
+                """
+                SELECT order_id FROM paper_orders
+                WHERE account_id=? AND status='PENDING' AND execute_after <= ?
+                ORDER BY execute_after, order_id LIMIT ?
+                """,
+                (int(account["account_id"]), due, max(0, int(limit))),
+            ).fetchall()
+        return [int(row["order_id"]) for row in rows]
+
+    def claim_order(self, order_id: int, submitted_at: str) -> Optional[Dict[str, Any]]:
+        submitted = canonical_timestamp(submitted_at)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE paper_orders
+                SET status='SUBMITTED', submitted_at=?, attempts=attempts+1, updated_at=?
+                WHERE order_id=? AND status='PENDING'
+                  AND execute_after <= ? AND expires_at >= ?
+                """,
+                (submitted, submitted, int(order_id), submitted, submitted),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                """
+                SELECT o.*, a.name AS account_name, a.initial_cash, a.cash,
+                       m.token_a, m.token_b, m.status AS match_status,
+                       m.live AS match_live, m.ended AS match_ended,
+                       f.entry_enabled AS forecast_entry_enabled
+                FROM paper_orders o
+                JOIN paper_accounts a ON a.account_id=o.account_id
+                JOIN matches m ON m.match_id=o.match_id
+                JOIN forecasts f ON f.forecast_id=o.forecast_id
+                WHERE o.order_id=?
+                """,
+                (int(order_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def retry_order(
+        self, order_id: int, execute_after: str, error: str
+    ) -> None:
+        due = canonical_timestamp(execute_after)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE paper_orders
+                SET status='PENDING', execute_after=?, submitted_at=NULL,
+                    last_error=?, updated_at=?
+                WHERE order_id=? AND status='SUBMITTED'
+                """,
+                (due, str(error)[:500], isoformat(utc_now()), int(order_id)),
+            )
+
+    def reject_order(self, order_id: int, reason: str, completed_at: str) -> None:
+        completed = canonical_timestamp(completed_at)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE paper_orders
+                SET status='REJECTED', rejection_reason=?, completed_at=?, updated_at=?
+                WHERE order_id=? AND status IN ('PENDING', 'SUBMITTED')
+                """,
+                (str(reason), completed, completed, int(order_id)),
+            )
+
+    def execution_kill_switch(self, account_id: int) -> Dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_controls WHERE account_id=?",
+                (int(account_id),),
+            ).fetchone()
+        return dict(row) if row is not None else {
+            "account_id": int(account_id), "kill_switch": 0, "reason": ""
+        }
+
+    def set_execution_kill_switch(
+        self, account_name: str, enabled: bool, reason: str = ""
+    ) -> Dict[str, Any]:
+        account_id = self.ensure_account(account_name)
+        now = isoformat(utc_now())
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_controls(account_id, kill_switch, reason, updated_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    kill_switch=excluded.kill_switch,
+                    reason=excluded.reason,
+                    updated_at=excluded.updated_at
+                """,
+                (account_id, int(bool(enabled)), str(reason), now),
+            )
+        return self.execution_kill_switch(account_id)
+
+    def paper_accounts_for_match(self, match_id: str) -> List[str]:
+        """Accounts whose live orders or positions need terminal handling."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT a.name
+                FROM paper_accounts a
+                JOIN paper_positions p ON p.account_id=a.account_id
+                WHERE p.match_id=? AND p.shares>0
+                UNION
+                SELECT a.name
+                FROM paper_accounts a
+                JOIN paper_orders o ON o.account_id=a.account_id
+                WHERE o.match_id=? AND o.status IN ('PENDING','SUBMITTED')
+                ORDER BY name
+                """,
+                (match_id, match_id),
+            ).fetchall()
+        return [str(row["name"]) for row in rows]
+
+    def update_executor_status(
+        self,
+        *,
+        worker_id: str,
+        status: str,
+        processed_delta: int = 0,
+        filled_delta: int = 0,
+        partial_delta: int = 0,
+        rejected_delta: int = 0,
+        errors_delta: int = 0,
+        last_error: str = "",
+        touched_order: bool = False,
+    ) -> None:
+        now = isoformat(utc_now())
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO executor_status(
+                    singleton, worker_id, status, last_heartbeat_at, last_order_at,
+                    processed, filled, partial, rejected, errors, last_error
+                ) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    worker_id=excluded.worker_id,
+                    status=excluded.status,
+                    last_heartbeat_at=excluded.last_heartbeat_at,
+                    last_order_at=CASE
+                        WHEN excluded.last_order_at IS NOT NULL THEN excluded.last_order_at
+                        ELSE executor_status.last_order_at
+                    END,
+                    processed=executor_status.processed+excluded.processed,
+                    filled=executor_status.filled+excluded.filled,
+                    partial=executor_status.partial+excluded.partial,
+                    rejected=executor_status.rejected+excluded.rejected,
+                    errors=executor_status.errors+excluded.errors,
+                    last_error=CASE
+                        WHEN excluded.last_error<>'' THEN excluded.last_error
+                        ELSE executor_status.last_error
+                    END
+                """,
+                (
+                    str(worker_id), str(status), now, now if touched_order else None,
+                    int(processed_delta), int(filled_delta), int(partial_delta),
+                    int(rejected_delta), int(errors_delta), str(last_error)[:500],
+                ),
+            )
+
+    def executor_status(self) -> Dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM executor_status WHERE singleton=1"
+            ).fetchone()
+        return dict(row) if row is not None else {}
 
     def resolve_match(self, match_id: str, winner: str, resolved_at: str) -> None:
         if winner not in ("A", "B"):
@@ -1306,6 +1771,15 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 """
+                UPDATE paper_orders
+                SET status='CANCELLED', rejection_reason='match_void',
+                    completed_at=?, updated_at=?
+                WHERE match_id=? AND status IN ('PENDING','SUBMITTED')
+                """,
+                (resolved, resolved, match_id),
+            )
+            connection.execute(
+                """
                 UPDATE matches
                 SET status='void', winner=NULL, resolved_at=?, live=0, ended=1,
                     finished_observed_at=COALESCE(finished_observed_at, ?), updated_at=?
@@ -1503,6 +1977,7 @@ class Database:
                 SELECT
                     f.forecast_at, f.probability_a, f.market_midpoint_a,
                     f.edge_a, f.edge_b, f.best_side, f.model_version, f.strategy,
+                    f.execution_mode,
                     s.maps_a, s.maps_b, s.rounds_a, s.rounds_b, s.current_map,
                     s.source AS state_source, s.source_at AS state_source_at,
                     b.bid_a, b.ask_a, b.bid_b, b.ask_b
@@ -1533,6 +2008,8 @@ class Database:
             ).fetchone()
             positions: List[Dict[str, Any]] = []
             trades: List[Dict[str, Any]] = []
+            orders: List[Dict[str, Any]] = []
+            fills: List[Dict[str, Any]] = []
             if account is not None:
                 positions = [
                     dict(item)
@@ -1555,8 +2032,35 @@ class Database:
                         (account["account_id"], match_id),
                     ).fetchall()
                 ]
+                orders = [
+                    dict(item)
+                    for item in connection.execute(
+                        """
+                        SELECT * FROM paper_orders
+                        WHERE account_id=? AND match_id=?
+                        ORDER BY order_id DESC LIMIT 50
+                        """,
+                        (account["account_id"], match_id),
+                    ).fetchall()
+                ]
+                fills = [
+                    dict(item)
+                    for item in connection.execute(
+                        """
+                        SELECT pf.*, po.decision_strategy, po.entry_strategy,
+                               po.signal_price, po.requested_shares
+                        FROM paper_fills pf
+                        JOIN paper_orders po ON po.order_id=pf.order_id
+                        WHERE po.account_id=? AND po.match_id=?
+                        ORDER BY pf.fill_id DESC LIMIT 100
+                        """,
+                        (account["account_id"], match_id),
+                    ).fetchall()
+                ]
             detail["positions"] = positions
             detail["trades"] = trades
+            detail["orders"] = orders
+            detail["fills"] = fills
 
         prior = self.latest_prior(match_id)
         if prior is not None and prior.get("market_probability_a") is None:
@@ -1726,7 +2230,8 @@ class Database:
             for row in connection.execute(
                 """
                 SELECT strategy, count(*) AS n FROM forecasts
-                WHERE paper_enabled=1 GROUP BY strategy
+                WHERE paper_enabled=1 AND execution_mode='depth-sim'
+                GROUP BY strategy
                 """
             ).fetchall():
                 if row["strategy"] in summary:
@@ -1746,7 +2251,8 @@ class Database:
                        sum(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
                        sum(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
                        sum(CASE WHEN action='SETTLE' THEN 1 ELSE 0 END) AS settles
-                FROM paper_trades WHERE account_id=?
+                FROM paper_trades
+                WHERE account_id=? AND execution_mode='depth-sim'
                 GROUP BY decision_strategy
                 """,
                 (account_id,),
@@ -1759,7 +2265,8 @@ class Database:
             for row in connection.execute(
                 """
                 SELECT entry_strategy, COALESCE(sum(realized_pnl), 0) AS pnl
-                FROM paper_trades WHERE account_id=?
+                FROM paper_trades
+                WHERE account_id=? AND execution_mode='depth-sim'
                 GROUP BY entry_strategy
                 """,
                 (account_id,),
@@ -1779,6 +2286,7 @@ class Database:
                     ORDER BY b2.source_at DESC, b2.book_id DESC LIMIT 1
                 )
                 WHERE p.account_id=? AND p.shares>0
+                  AND p.execution_mode='depth-sim'
                 """,
                 (account_id,),
             ).fetchall()
@@ -1799,6 +2307,99 @@ class Database:
             item["unrealized_pnl"] = item["mark_value"] - item["open_cost"]
             item["total_pnl"] = item["realized_pnl"] + item["unrealized_pnl"]
         return [summary[strategy] for strategy in STRATEGIES]
+
+    def execution_summary(self, account_name: str = "live-paper") -> Dict[str, Any]:
+        """Fill quality, rejection mix, risk controls, and worker liveness."""
+        summary: Dict[str, Any] = {
+            "mode": "depth-sim",
+            "orders": 0,
+            "pending": 0,
+            "filled_orders": 0,
+            "partial_orders": 0,
+            "rejected_orders": 0,
+            "requested_shares": 0.0,
+            "filled_shares": 0.0,
+            "fill_rate": None,
+            "fees": 0.0,
+            "avg_slippage": None,
+            "avg_latency_ms": None,
+            "depth_books": 0,
+            "rejections": [],
+            "kill_switch": False,
+            "kill_switch_reason": "",
+            "worker": self.executor_status(),
+        }
+        with self.connect() as connection:
+            account = connection.execute(
+                "SELECT account_id FROM paper_accounts WHERE name=?", (account_name,)
+            ).fetchone()
+            summary["depth_books"] = int(
+                connection.execute(
+                    "SELECT count(*) FROM market_snapshots WHERE depth_available=1"
+                ).fetchone()[0]
+            )
+            if account is None:
+                return summary
+            account_id = int(account["account_id"])
+            row = connection.execute(
+                """
+                SELECT count(*) AS orders,
+                       sum(CASE WHEN status IN ('PENDING','SUBMITTED') THEN 1 ELSE 0 END) pending,
+                       sum(CASE WHEN status='FILLED' THEN 1 ELSE 0 END) filled_orders,
+                       sum(CASE WHEN status='PARTIALLY_FILLED' THEN 1 ELSE 0 END) partial_orders,
+                       sum(CASE WHEN status IN ('REJECTED','EXPIRED','CANCELLED') THEN 1 ELSE 0 END) rejected_orders,
+                       COALESCE(sum(requested_shares), 0) requested_shares,
+                       COALESCE(sum(filled_shares), 0) filled_shares,
+                       COALESCE(sum(fee_paid), 0) fees
+                FROM paper_orders WHERE account_id=?
+                """,
+                (account_id,),
+            ).fetchone()
+            for key in (
+                "orders", "pending", "filled_orders", "partial_orders",
+                "rejected_orders",
+            ):
+                summary[key] = int(row[key] or 0)
+            for key in ("requested_shares", "filled_shares", "fees"):
+                summary[key] = float(row[key] or 0.0)
+            if summary["requested_shares"] > 0:
+                summary["fill_rate"] = (
+                    summary["filled_shares"] / summary["requested_shares"]
+                )
+            quality = connection.execute(
+                """
+                SELECT avg(slippage) AS slippage, avg(fill_latency_ms) AS latency
+                FROM paper_trades
+                WHERE account_id=? AND execution_mode='depth-sim'
+                  AND action IN ('BUY','SELL')
+                """,
+                (account_id,),
+            ).fetchone()
+            if quality["slippage"] is not None:
+                summary["avg_slippage"] = float(quality["slippage"])
+            if quality["latency"] is not None:
+                summary["avg_latency_ms"] = float(quality["latency"])
+            summary["rejections"] = [
+                dict(item)
+                for item in connection.execute(
+                    """
+                    SELECT rejection_reason AS reason, count(*) AS count
+                    FROM paper_orders
+                    WHERE account_id=? AND rejection_reason<>''
+                    GROUP BY rejection_reason ORDER BY count(*) DESC, rejection_reason
+                    LIMIT 8
+                    """,
+                    (account_id,),
+                ).fetchall()
+            ]
+            control = connection.execute(
+                "SELECT kill_switch, reason FROM execution_controls WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+            if control is not None:
+                summary["kill_switch"] = bool(control["kill_switch"])
+                summary["kill_switch_reason"] = str(control["reason"] or "")
+        return summary
 
     def dashboard_payload(self, account_name: str = "live-paper") -> Dict[str, Any]:
         with self.connect() as connection:
@@ -1825,6 +2426,8 @@ class Database:
                 "forecasts": connection.execute("SELECT count(*) FROM forecasts").fetchone()[0],
                 "priors": connection.execute("SELECT count(*) FROM llm_priors").fetchone()[0],
                 "trades": connection.execute("SELECT count(*) FROM paper_trades").fetchone()[0],
+                "orders": connection.execute("SELECT count(*) FROM paper_orders").fetchone()[0],
+                "fills": connection.execute("SELECT count(*) FROM paper_fills").fetchone()[0],
                 "resolved": connection.execute(
                     "SELECT count(*) FROM matches WHERE status='resolved'"
                 ).fetchone()[0],
@@ -1841,6 +2444,7 @@ class Database:
             "scoring": self.scoring_summary(),
             "matches": self.latest_rows(),
             "account": self.account_payload(account_name),
+            "execution": self.execution_summary(account_name),
         }
 
     def scoring_summary(self) -> Dict[str, Any]:

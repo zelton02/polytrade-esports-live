@@ -1,6 +1,6 @@
 from dataclasses import asdict, dataclass
 from datetime import timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .timeutil import canonical_timestamp, isoformat, parse_timestamp, utc_now
 
@@ -105,6 +105,19 @@ class LiveState:
 
 
 @dataclass(frozen=True)
+class BookLevel:
+    price: float
+    size: float
+
+    def normalized(self) -> "BookLevel":
+        price = _probability("book level price", self.price)
+        size = float(self.size)
+        if size <= 0.0:
+            raise ValueError("book level size must be positive")
+        return BookLevel(price=price, size=size)
+
+
+@dataclass(frozen=True)
 class BookQuote:
     match_id: str
     bid_a: float
@@ -146,6 +159,40 @@ class BookQuote:
     @property
     def midpoint_a(self) -> float:
         return (self.bid_a + self.ask_a) / 2.0
+
+    def levels(self, outcome: str, side: str) -> List[BookLevel]:
+        """Return canonical price/size depth from the immutable raw snapshot.
+
+        Polymarket sends one CLOB book per outcome token.  Keeping both books
+        inside ``raw`` lets the probability layer retain its compact BBO type
+        while the execution layer can consume the actual depth.  No synthetic
+        fallback is created here: production orders must fail closed when a
+        provider supplied only top-of-book prices.
+        """
+        outcome = str(outcome).upper()
+        side = str(side).lower()
+        if outcome not in ("A", "B"):
+            raise ValueError("outcome must be A or B")
+        if side not in ("bids", "asks"):
+            raise ValueError("book side must be bids or asks")
+        raw = dict(self.raw or {})
+        book = raw.get(outcome)
+        if not isinstance(book, dict):
+            return []
+        merged: Dict[float, float] = {}
+        for item in list(book.get(side) or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                level = BookLevel(item["price"], item["size"]).normalized()
+            except (KeyError, TypeError, ValueError):
+                continue
+            merged[level.price] = merged.get(level.price, 0.0) + level.size
+        reverse = side == "bids"
+        return [
+            BookLevel(price=price, size=merged[price])
+            for price in sorted(merged, reverse=reverse)
+        ]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -17,12 +17,14 @@ Polymarket Gamma  --discover-->  open CS2 match markets
 Hermes / DeepSeek --pre-match--> prior_probability_a + written rationale
 Sports WebSocket --live------>   maps, rounds, current map (joined by gameId)
 Canonical guard  --validate-->  monotonic map/round state, freeze on degradation
-Polymarket CLOB   --book------>  executable bid/ask
+Polymarket CLOB   --books----->  paired BBO + full price/size depth
                                           |
                                     engine.tick
                                           |
-                        forecast + edge vs ask + capped paper position
+                         forecast + edge vs ask + delayed IOC order
                                           |
+                     executor --fresh depth--> fills + fees + PnL
+                                           |
                                    SQLite --> dashboard
 ```
 
@@ -53,9 +55,19 @@ sized from it.
   risk, and cannot open or increase a position.
 - Rejects map-score and same-map round-score regressions, freezes the last
   trusted state, and stores the rejected candidate and reason for audit.
-- Stores executable Polymarket bid/ask snapshots separately from game state.
+- Fetches both outcome books in one Polymarket CLOB `/books` request and keeps
+  the exact price/size depth used for each simulated execution.
 - Computes edge against the ask, never against a decorative midpoint.
-- Rebalances a capped paper position with entry/exit hysteresis.
+- Turns model decisions into delayed IOC paper orders; the strategy cannot
+  directly mutate cash or positions.
+- Walks real depth after deterministic latency, supports partial fills, enforces
+  limit price, slippage and market-participation caps, and applies the sports
+  taker-fee curve.
+- Enforces per-match and portfolio risk, maximum open positions, daily loss
+  stop, stale/missing-book fail-closed behavior, retries with TTL, and a manual
+  entry kill switch that still allows risk-reducing exits.
+- Keeps legacy instant-fill history in its old accounts and starts the final
+  simulator in a separate `execution-paper` ledger.
 - Replays JSONL fixtures deterministically for research and tests.
 - Settles finished matches from the Polymarket result and scores the AI prior
   against the market baseline (Brier, log loss, hit rate).
@@ -74,7 +86,7 @@ sized from it.
 | Layer | Source | Key needed |
 |---|---|---|
 | Match discovery, teams, tokens | Polymarket Gamma `/events?tag_slug=esports` | no |
-| Order book (bid/ask) | Polymarket CLOB `/book` | no |
+| Paired order-book depth | Polymarket CLOB `/books` | no |
 | Maps won, rounds, current map | Polymarket Sports `wss://sports-api.polymarket.com/ws` | no |
 | Live-state fallback | PandaScore `/csgo/matches/running` | **yes**, detail depends on plan |
 | Maps won (fallback) | resolved per-map Gamma markets | no |
@@ -130,6 +142,10 @@ python3 -m polytrade_esports collect --db data/esports_live.sqlite3 --cycles 1
 # run continuously
 python3 -m polytrade_esports collect --db data/esports_live.sqlite3 --cycles 0 --interval-seconds 60
 
+# execute delayed orders from fresh CLOB depth (run as a separate process)
+python3 -m polytrade_esports execute \
+  --db data/esports_live.sqlite3 --account execution-paper
+
 # price upcoming matches with the LLM (see the candidates first)
 python3 -m polytrade_esports forecast-priors --db data/esports_live.sqlite3 --dry-run
 
@@ -165,6 +181,55 @@ against the market over time is not visible anywhere else, and it is what
 separates a considered disagreement from the model simply lagging the book.
 Map-score changes are marked on it, since those are the moments the model was
 supposed to move.
+
+## Paper execution and risk
+
+The execution boundary is intentionally strict:
+
+```
+forecast -> PENDING IOC -> simulated latency -> fresh paired /books snapshot
+         -> risk checks -> walk eligible depth -> fills -> cash/position/PnL
+```
+
+Only `executor.py` may create fills or move portfolio balances. A newer
+forecast may cancel an order that is still pending, but cannot erase one that
+has already reached the simulated venue. Every order keeps its signal price,
+limit, requested and filled shares, attempts, completion status, rejection
+reason and configuration. Every depth level actually consumed becomes an
+immutable fill linked to the exact execution snapshot.
+
+The production defaults are deliberately conservative:
+
+| Control | Default |
+|---|---:|
+| Signal-to-venue latency | 1,250ms ± 250ms deterministic jitter |
+| IOC lifetime after arrival | 8s |
+| Maximum execution-book age | 5s |
+| Maximum adverse slippage | 3 probability points |
+| Maximum share of displayed depth consumed | 10% per level |
+| Per-match risk budget | 1% of initial bankroll |
+| Total open-cost ceiling | 5% of initial bankroll |
+| Maximum open positions | 8 |
+| Daily realized-loss stop | 3% of initial bankroll |
+| Market-data attempts | 3 |
+
+Missing depth, a stale book, an unavailable token, an expired order, a closed
+match, or a disabled entry is a visible rejection—not an invented top-of-book
+fill. The dashboard reports worker heartbeat, fill rate, slippage, latency,
+fees and rejection mix. To stop new entries without trapping existing risk:
+
+```bash
+python3 -m polytrade_esports kill-switch \
+  --db data/esports_live.sqlite3 --account execution-paper \
+  --enable --reason "operator review"
+
+python3 -m polytrade_esports kill-switch \
+  --db data/esports_live.sqlite3 --account execution-paper --disable
+```
+
+`replay` and `demo` use the same matching, fee, position and risk code. Old
+BBO-only fixtures receive explicitly labelled synthetic depth for compatibility;
+they are not mixed with the live `execution-paper` cohort.
 
 ## The stale-model guard
 
@@ -220,7 +285,7 @@ Strategy labels describe the information horizon used for each decision:
 | `round-live` | Live decision from an accepted round-level snapshot |
 
 Paper positions keep their opening strategy even if a later horizon reduces or
-settles them. The dashboard reports grounded-paper-eligible decisions and trades
+settles them. The dashboard reports depth-sim-eligible decisions and trades
 by decision horizon, while realized/open PnL is attributed to the strategy that
 opened the exposure. Forecasts written before this eligibility flag existed are
 kept for audit but excluded from decision counts rather than guessed into them.
@@ -407,8 +472,8 @@ the cap, but it cannot stop a call failing when the account is empty.
 
 ## Deployment
 
-`compose.yaml` runs three containers: a collector loop, the DeepSeek prior loop,
-and a read-only dashboard on `127.0.0.1:8788`. All are unprivileged,
+`compose.yaml` runs four containers: collector, execution worker, DeepSeek prior
+loop, and a read-only dashboard on `127.0.0.1:8788`. All are unprivileged,
 read-only-rootfs and resource-capped. `deploy/` also contains the optional Hermes
 prior timer and the Cloudflare tunnel unit.
 
@@ -420,9 +485,10 @@ DASH_AUTH=user:password deploy/deploy.sh
 Use the script rather than `docker compose up -d --build`. On a host without the
 buildx plugin `docker compose build` **exits 0 and does nothing**, so the deploy
 reports success while the containers keep serving the previous image. The script
-builds the tag with `docker build`, recreates, and then compares the sha of the
-CSS the server actually returns against the file on disk, because a correct
-image proves nothing while a stale container still holds the port.
+builds the tag with `docker build`, recreates, verifies the source hash and all
+five dashboard assets inside the running container, then checks health and
+authentication. A correct image proves nothing while a stale container still
+holds the port.
 
 ## Add a real paper match
 
@@ -470,7 +536,9 @@ local observation timestamp, raw payload, and generated forecast is persisted.
 ## Normalized JSONL feed
 
 `replay` accepts one JSON object per line. Required values are match state and
-both outcome books:
+both outcome BBOs. Full `A`/`B` bid/ask level arrays are preferred; old BBO-only
+fixtures are given explicitly labelled synthetic depth and are suitable only
+for deterministic compatibility tests:
 
 ```json
 {"source_at":"2026-08-28T10:00:00Z","maps_a":1,"maps_b":1,"rounds_a":6,"rounds_b":6,"current_map":"Inferno","side_advantage_a":0.05,"economy_a":0.4,"economy_b":-0.2,"bid_a":0.58,"ask_a":0.59,"bid_b":0.41,"ask_b":0.42}
@@ -485,7 +553,8 @@ python3 -m polytrade_esports replay \
 
 ## Model boundary
 
-This V0 is deliberately a transparent state updater, not a trained black box:
+The probability layer is deliberately a transparent state updater, not a
+trained black box:
 
 1. Convert the pre-match series prior into an implied fresh-map probability.
 2. Convert the map probability into an implied per-round probability.
@@ -500,9 +569,9 @@ frozen before evaluating a prospective cohort.
 
 - `PolymarketBookClient`: implemented with `urllib` and the public CLOB REST API.
 - Normalized JSONL/manual state: implemented and usable now.
-- GRID: recommended official live provider. Exact GraphQL mapping is added after
-  access is granted because its schema and credentials are account-scoped.
-- HTML scraping is intentionally not part of V0; it is fragile and can violate
+- Polymarket Sports WebSocket: implemented primary live map/round adapter,
+  joined by the exact provider game id and guarded for freshness/regressions.
+- HTML scraping is intentionally not part of the system; it is fragile and can violate
   provider terms.
 
 ## Research safety

@@ -4,7 +4,7 @@ from .paper import PaperConfig, rebalance
 from .probability import live_probability
 from .storage import Database
 from .state_guard import validate_strategy
-from .timeutil import isoformat, utc_now
+from .timeutil import canonical_timestamp, isoformat, utc_now
 from .types import BookQuote, LiveState
 
 
@@ -17,6 +17,7 @@ def tick(
     paper_enabled: bool = True,
     entry_enabled: bool = True,
     strategy: str = "pre-match",
+    decision_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Record one state/book observation, forecast, and optionally rebalance.
 
@@ -40,7 +41,7 @@ def tick(
     best_side = None
     if best_edge > 0:
         best_side = "A" if edge_a >= edge_b else "B"
-    forecast_at = isoformat(utc_now())
+    forecast_at = canonical_timestamp(decision_at or isoformat(utc_now()))
     state_id = database.record_state(normalized_state)
     book_id = database.record_book(normalized_quote)
     forecast_id = database.record_forecast(
@@ -58,6 +59,7 @@ def tick(
         strategy=strategy,
         paper_enabled=paper_enabled,
         entry_enabled=paper_enabled and entry_enabled,
+        execution_mode="depth-sim",
     )
     # Drift since our own view last had reason to change.
     anchor_market = database.market_at_last_state_change(
@@ -79,6 +81,7 @@ def tick(
             market_drift=market_drift,
             entry_enabled=entry_enabled,
             strategy=strategy,
+            signal_at=forecast_at,
         )
         if paper_enabled
         else []

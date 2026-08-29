@@ -136,6 +136,51 @@ class ResolverTests(unittest.TestCase):
         row = self.db.dashboard_payload()["matches"][0]
         self.assertEqual((row["live"], row["ended"]), (0, 1))
 
+    def test_resolution_settles_positions_in_every_isolated_ledger(self):
+        match_id = "cs2-lavked-eac-2026-08-29"
+        stamp = isoformat(utc_now() - timedelta(hours=7))
+        state_id = self.db.record_state(
+            LiveState(match_id, stamp, 0, 0, 0, 0, observed_at=stamp)
+        )
+        book_id = self.db.record_book(
+            BookQuote(
+                match_id, 0.49, 0.50, 0.50, 0.51, stamp,
+                observed_at=stamp,
+            )
+        )
+        forecast_id = self.db.record_forecast(
+            match_id, state_id, book_id, stamp, "test", 0.6, 0.495,
+            0.1, -0.11, "A", {}, execution_mode="depth-sim",
+        )
+        old_id = self.db.ensure_account("legacy-paper")
+        new_id = self.db.ensure_account("execution-paper")
+        with self.db.connect() as connection:
+            for account_id, mode in ((old_id, "legacy"), (new_id, "depth-sim")):
+                connection.execute(
+                    "UPDATE paper_accounts SET cash=995 WHERE account_id=?",
+                    (account_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_positions(
+                        account_id, match_id, outcome, shares, avg_cost,
+                        realized_pnl, execution_mode, updated_at
+                    ) VALUES(?, ?, 'A', 10, 0.5, 0, ?, ?)
+                    """,
+                    (account_id, match_id, mode, stamp),
+                )
+        result = resolve_open_matches(
+            self.db,
+            gamma=FakeGamma({match_id: settled(0)}),
+            account_name="execution-paper",
+        )
+        self.assertEqual(result.settled_trades, 2)
+        for account in ("legacy-paper", "execution-paper"):
+            payload = self.db.account_payload(account)
+            self.assertAlmostEqual(payload["cash"], 1005.0)
+            self.assertEqual(payload["positions"], [])
+            self.assertEqual(payload["trades"][0]["forecast_id"], forecast_id)
+
     def test_finished_unsettled_match_is_pending_not_live(self):
         self.db.update_match_lifecycle(
             "cs2-lavked-eac-2026-08-29", live=True, ended=False

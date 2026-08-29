@@ -413,6 +413,25 @@ const tests = {
     assert.strictEqual(document.getElementById("live-label").textContent, "PARTIAL ROUND FEED");
   },
 
+  "execution quality and worker health are visible"() {
+    const { context, document } = boot();
+    const data = payload([match()]);
+    data.execution = {
+      orders: 12, pending: 2, rejected_orders: 3,
+      filled_orders: 6, partial_orders: 1, fill_rate: 0.82,
+      avg_slippage: 0.014, avg_latency_ms: 1432, fees: 0.74,
+      kill_switch: false,
+      worker: { status: "running", last_heartbeat_at: new Date().toISOString() },
+    };
+    context.render(data);
+    assert.ok(/RUNNING/.test(document.getElementById("exec-status").textContent));
+    assert.strictEqual(document.getElementById("exec-orders").textContent, "12 TOTAL · O2 · R3");
+    assert.ok(/82.0%/.test(document.getElementById("exec-fill-rate").textContent));
+    assert.strictEqual(document.getElementById("exec-slippage").textContent, "+1.4%");
+    assert.strictEqual(document.getElementById("exec-latency").textContent, "1432ms");
+    assert.ok(/\$0.74/.test(document.getElementById("exec-risk").textContent));
+  },
+
   "strategy cohorts report separate decisions trades and pnl"() {
     const { context, document } = boot();
     const data = payload([match()]);

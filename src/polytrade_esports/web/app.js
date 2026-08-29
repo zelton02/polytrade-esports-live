@@ -486,7 +486,7 @@ function syncTrades(node, trades) {
   if (!trades.length) {
     var row = el("tr");
     var cell = el("td", null, "No paper trades yet.");
-    cell.colSpan = 8;
+    cell.colSpan = 10;
     row.appendChild(cell);
     node.appendChild(row);
     return;
@@ -500,6 +500,8 @@ function syncTrades(node, trades) {
     line.appendChild(el("td", null, trade.outcome));
     line.appendChild(el("td", "num", Number(trade.shares).toFixed(3)));
     line.appendChild(el("td", "num", pct(trade.price)));
+    line.appendChild(el("td", "num " + (Number(trade.slippage || 0) > 0 ? "down" : "flat"), signedPct(trade.slippage || 0)));
+    line.appendChild(el("td", "num", money(trade.fee || 0)));
     line.appendChild(el("td", null, trade.reason));
     node.appendChild(line);
   });
@@ -558,6 +560,61 @@ function renderFeedHealth(data) {
     document.getElementById("feed-rejected"),
     whole(rejected || 0) + " TOTAL · " + whole(feed.rejected_transitions || 0) + " CYCLE"
   );
+}
+
+function renderExecution(data) {
+  var execution = data.execution || {};
+  var worker = execution.worker || {};
+  var heartbeatAge = ageMs(worker.last_heartbeat_at);
+  var statusNode = document.getElementById("exec-status");
+  var status;
+  var tone;
+  if (execution.kill_switch) {
+    status = "KILL SWITCH";
+    tone = "bad";
+  } else if (!worker.last_heartbeat_at) {
+    status = "STARTING";
+    tone = "warn";
+  } else if (heartbeatAge > 15000) {
+    status = "STALE · " + secondsAgo(worker.last_heartbeat_at);
+    tone = "bad";
+  } else if (worker.status === "degraded") {
+    status = "DEGRADED";
+    tone = "warn";
+  } else {
+    status = "RUNNING · " + secondsAgo(worker.last_heartbeat_at);
+    tone = "good";
+  }
+  setText(statusNode, status);
+  setClass(statusNode, tone);
+  setText(
+    document.getElementById("exec-orders"),
+    whole(execution.orders || 0) + " TOTAL · O" +
+      whole(execution.pending || 0) + " · R" +
+      whole(execution.rejected_orders || 0)
+  );
+  setText(
+    document.getElementById("exec-fill-rate"),
+    execution.fill_rate === null || execution.fill_rate === undefined
+      ? "AWAITING FILLS"
+      : pct(execution.fill_rate) + " · F" + whole(execution.filled_orders || 0) +
+        " / P" + whole(execution.partial_orders || 0)
+  );
+  var slippage = document.getElementById("exec-slippage");
+  setText(slippage, signedPct(execution.avg_slippage));
+  setClass(slippage, Number(execution.avg_slippage || 0) > 0 ? "bad" : "good");
+  setText(
+    document.getElementById("exec-latency"),
+    execution.avg_latency_ms === null || execution.avg_latency_ms === undefined
+      ? "—" : Math.round(Number(execution.avg_latency_ms)) + "ms"
+  );
+  var risk = document.getElementById("exec-risk");
+  setText(
+    risk,
+    money(execution.fees || 0) + " · " +
+      (execution.kill_switch ? String(execution.kill_switch_reason || "BLOCKED").toUpperCase() : "LIMITS ON")
+  );
+  setClass(risk, execution.kill_switch ? "bad" : "good");
 }
 
 /* Scoreboard ------------------------------------------------------------- */
@@ -658,6 +715,7 @@ function render(data) {
 
   var run = data.collector;
   renderFeedHealth(data);
+  renderExecution(data);
   setText(
     document.getElementById("cycle"),
     "SYNC " + clock(data.generated_at) +

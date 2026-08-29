@@ -1,14 +1,47 @@
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from polytrade_esports.engine import tick
+from polytrade_esports.executor import process_due_orders
 from polytrade_esports.storage import Database
-from polytrade_esports.timeutil import isoformat, utc_now
+from polytrade_esports.timeutil import isoformat, parse_timestamp, utc_now
 from polytrade_esports.types import BookQuote, LiveState, Match
 
 
 STAMP = "2026-08-27T00:00:00Z"
+
+
+def execute_quote(database, quote, account="live-paper"):
+    executed_at = isoformat(utc_now() + timedelta(seconds=2))
+    size = 10000.0
+    depth = BookQuote(
+        quote.match_id,
+        quote.bid_a,
+        quote.ask_a,
+        quote.bid_b,
+        quote.ask_b,
+        source_at=executed_at,
+        observed_at=executed_at,
+        source="test-depth",
+        raw={
+            "A": {
+                "bids": [{"price": quote.bid_a, "size": size}],
+                "asks": [{"price": quote.ask_a, "size": size}],
+            },
+            "B": {
+                "bids": [{"price": quote.bid_b, "size": size}],
+                "asks": [{"price": quote.ask_b, "size": size}],
+            },
+        },
+    )
+    return process_due_orders(
+        database,
+        account,
+        now=executed_at,
+        supplied_quotes={quote.match_id: depth},
+    )
 
 
 class EnginePaperTests(unittest.TestCase):
@@ -26,6 +59,7 @@ class EnginePaperTests(unittest.TestCase):
         quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
         result = tick(self.db, state, quote)
         self.assertEqual(result["paper_actions"][0]["action"], "BUY")
+        execute_quote(self.db, quote)
         account = self.db.account_payload()
         spent = 1000.0 - account["cash"]
         self.assertLessEqual(spent, 10.0 + 1e-8)
@@ -35,6 +69,7 @@ class EnginePaperTests(unittest.TestCase):
         quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
         result = tick(self.db, state, quote, strategy="round-live")
         self.assertEqual(result["strategy"], "round-live")
+        execute_quote(self.db, quote)
         account = self.db.account_payload()
         self.assertEqual(account["trades"][0]["decision_strategy"], "round-live")
         self.assertEqual(account["trades"][0]["entry_strategy"], "round-live")
@@ -71,6 +106,7 @@ class EnginePaperTests(unittest.TestCase):
         state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
         opening = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
         self.assertTrue(tick(self.db, state, opening)["paper_actions"])
+        execute_quote(self.db, opening)
 
         later = "2026-08-27T00:01:00Z"
         expensive = BookQuote(
@@ -91,6 +127,7 @@ class EnginePaperTests(unittest.TestCase):
         opening = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
         first_book = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
         tick(self.db, opening, first_book)
+        execute_quote(self.db, first_book)
         later_stamp = "2026-08-27T00:10:00Z"
         trailing = LiveState("m1", later_stamp, 1, 1, 4, 11, economy_a=-1, economy_b=1, observed_at=later_stamp)
         later_book = BookQuote("m1", 0.12, 0.14, 0.86, 0.88, later_stamp, observed_at=later_stamp)
@@ -106,6 +143,7 @@ class EnginePaperTests(unittest.TestCase):
         opening = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
         first_book = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
         tick(self.db, opening, first_book)
+        execute_quote(self.db, first_book)
         later_stamp = "2026-08-27T00:05:00Z"
         stronger = LiveState("m1", later_stamp, 1, 1, 8, 5, economy_a=1, economy_b=-1, observed_at=later_stamp)
         cheaper_book = BookQuote("m1", 0.28, 0.30, 0.70, 0.72, later_stamp, observed_at=later_stamp)
@@ -168,6 +206,11 @@ class StaleModelGuardTests(unittest.TestCase):
         self._tick(ask_a=0.09, bid_a=0.08)
         opened = self._tick(ask_a=0.09, bid_a=0.08, maps=(1, 0))
         self.assertTrue(any(a["action"] == "BUY" for a in opened["paper_actions"]))
+        now = isoformat(utc_now())
+        opening_quote = BookQuote(
+            "m1", 0.08, 0.09, 0.90, 0.92, now, now, "test"
+        )
+        execute_quote(self.db, opening_quote)
         # The market now runs far away with no state change of our own.
         closed = self._tick(ask_a=0.95, bid_a=0.94, maps=(1, 0))
         self.assertGreater(abs(closed["market_drift"]), 0.08)

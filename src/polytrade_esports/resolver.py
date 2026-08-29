@@ -133,14 +133,20 @@ def _resolve_event(
     except (KeyError, ValueError):
         forecast_id = None
     if forecast_id is not None:
-        actions = settle_match(
-            database=database,
-            account_name=account_name,
-            match_id=row["match_id"],
-            winner=winner,
-            forecast_id=forecast_id,
-        )
-        result.settled_trades += len(actions)
+        # A new execution methodology starts in a new account, but older
+        # accounts may still carry positions from this match. Resolution is a
+        # terminal event for all of them; settling only the collector's active
+        # account would strand legacy cash forever.
+        accounts = database.paper_accounts_for_match(row["match_id"])
+        for settlement_account in accounts:
+            actions = settle_match(
+                database=database,
+                account_name=settlement_account,
+                match_id=row["match_id"],
+                winner=winner,
+                forecast_id=forecast_id,
+            )
+            result.settled_trades += len(actions)
 
     result.decided.append(
         {

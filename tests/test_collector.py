@@ -153,7 +153,12 @@ class CollectorTests(unittest.TestCase):
             result.forecasts[0]["state_source"],
             "polymarket-sports-ws",
         )
-        self.assertGreater(self.db.dashboard_payload()["counts"]["trades"], 0)
+        payload = self.db.dashboard_payload()
+        self.assertGreater(payload["counts"]["orders"], 0)
+        self.assertEqual(
+            payload["counts"]["trades"], 0,
+            "collector may create an intent but only executor may create fills",
+        )
         self.assertEqual(result.forecasts[0]["strategy"], "round-live")
         self.assertEqual(result.feed_health["round_coverage"], 1.0)
         self.assertEqual(

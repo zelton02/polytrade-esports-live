@@ -20,10 +20,37 @@ class PolymarketBookClient:
         query = urlencode({"token_id": token_id})
         request = Request(
             "%s/book?%s" % (self.base_url, query),
-            headers={"Accept": "application/json", "User-Agent": "polytrade-esports-live/0.1"},
+            headers={"Accept": "application/json", "User-Agent": "polytrade-esports-live/0.5"},
         )
         with urlopen(request, timeout=self.timeout) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def get_books(self, token_ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch both outcome books in one CLOB request.
+
+        A paired snapshot avoids manufacturing a spread from two sequential
+        network round trips during a fast market move.  The public endpoint is
+        unauthenticated and returns the same full price/size arrays as /book.
+        """
+        tokens = [str(token).strip() for token in token_ids if str(token).strip()]
+        if not tokens:
+            raise ValueError("at least one Polymarket token id is required")
+        payload = json.dumps([{"token_id": token} for token in tokens]).encode("utf-8")
+        request = Request(
+            "%s/books" % self.base_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "polytrade-esports-live/0.5",
+            },
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            value = json.loads(response.read().decode("utf-8"))
+        if not isinstance(value, list):
+            raise ValueError("Polymarket /books returned a non-list payload")
+        return [dict(item) for item in value if isinstance(item, dict)]
 
     @staticmethod
     def _best(book: Dict[str, Any], side: str) -> float:
@@ -45,8 +72,20 @@ class PolymarketBookClient:
     def get_pair(self, match_id: str, token_a: str, token_b: str) -> BookQuote:
         if not token_a or not token_b:
             raise ValueError("both Polymarket token ids are required")
-        book_a = self.get_book(token_a)
-        book_b = self.get_book(token_b)
+        books = self.get_books([token_a, token_b])
+        by_asset = {
+            str(book.get("asset_id") or ""): book
+            for book in books
+            if str(book.get("asset_id") or "")
+        }
+        if token_a in by_asset and token_b in by_asset:
+            book_a, book_b = by_asset[token_a], by_asset[token_b]
+        elif len(books) == 2:
+            # Older CLOB responses did not include asset_id but preserved the
+            # request order.  Accept that legacy shape only when unambiguous.
+            book_a, book_b = books
+        else:
+            raise ValueError("Polymarket /books did not return both outcome tokens")
         observed_at = isoformat(utc_now())
         source_at = max(self._timestamp(book_a), self._timestamp(book_b))
         # The venue clock can lead ours by a second or two. That is skew, not a

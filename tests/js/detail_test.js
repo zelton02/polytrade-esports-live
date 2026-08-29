@@ -69,7 +69,7 @@ function detail(overrides) {
       },
       history: [point(), point({ probability_a: 0.22, market_midpoint_a: 0.285 })],
       latest: point({ probability_a: 0.22, market_midpoint_a: 0.285, edge_a: -0.07, edge_b: 0.06, best_side: "B" }),
-      positions: [], trades: [],
+      positions: [], trades: [], orders: [], fills: [],
     },
     overrides || {}
   );
@@ -136,6 +136,28 @@ const tests = {
     context.render(detail({ positions: [], trades: [] }));
     const paper = document.getElementById("d-paper").textContent;
     assert.ok(/entry threshold/.test(paper), paper);
+  },
+
+  "paper panel exposes delayed order execution quality"() {
+    const { context, document } = boot();
+    context.render(detail({
+      orders: [{
+        order_id: 1, signal_at: "2026-08-28T09:30:00Z",
+        completed_at: "2026-08-28T09:30:01.4Z",
+        decision_strategy: "round-live", status: "PARTIALLY_FILLED",
+        action: "BUY", outcome: "A", requested_shares: 10,
+        filled_shares: 4, signal_price: 0.30, avg_fill_price: 0.315,
+        fee_paid: 0.02, rejection_reason: "insufficient_executable_depth",
+        reason: "entry_or_increase",
+      }],
+      fills: [{ fill_id: 1 }, { fill_id: 2 }],
+    }));
+    const text = document.getElementById("d-paper").textContent;
+    assert.ok(/PARTIALLY_FILLED/.test(text), text);
+    assert.ok(/4\.000/.test(text), text);
+    assert.ok(/1400ms/.test(text), text);
+    assert.ok(/insufficient_executable_depth/.test(text), text);
+    assert.ok(/2 RECORDED DEPTH FILLS/.test(text), text);
   },
 
   "external evidence links cannot reach back through the opener"() {

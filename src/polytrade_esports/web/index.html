@@ -47,6 +47,15 @@
   <div class="feedcell"><span class="k">REJECTED</span><b id="feed-rejected">&mdash;</b></div>
 </section>
 
+<section class="feedrail executionrail" aria-label="Execution simulator health">
+  <div class="feedcell"><span class="k">EXECUTOR</span><b id="exec-status">&mdash;</b></div>
+  <div class="feedcell"><span class="k">ORDERS</span><b id="exec-orders">&mdash;</b></div>
+  <div class="feedcell"><span class="k">FILL RATE</span><b id="exec-fill-rate">&mdash;</b></div>
+  <div class="feedcell"><span class="k">AVG SLIPPAGE</span><b id="exec-slippage">&mdash;</b></div>
+  <div class="feedcell"><span class="k">AVG LATENCY</span><b id="exec-latency">&mdash;</b></div>
+  <div class="feedcell"><span class="k">FEES / RISK</span><b id="exec-risk">&mdash;</b></div>
+</section>
+
 <main>
   <section class="block">
     <h2 class="head"><span class="bar"></span>SCOREBOARD<span class="count" id="c-scored"></span></h2>
@@ -113,7 +122,7 @@
     <h2 class="head"><span class="bar"></span>PAPER LEDGER</h2>
     <div class="scroller">
       <table>
-        <thead><tr><th>TIME</th><th>MATCH</th><th>STRATEGY</th><th>ACT</th><th>SIDE</th><th class="num">SHARES</th><th class="num">PRICE</th><th>REASON</th></tr></thead>
+        <thead><tr><th>TIME</th><th>MATCH</th><th>STRATEGY</th><th>ACT</th><th>SIDE</th><th class="num">SHARES</th><th class="num">PRICE</th><th class="num">SLIP</th><th class="num">FEE</th><th>REASON</th></tr></thead>
         <tbody id="trades"></tbody>
       </table>
     </div>

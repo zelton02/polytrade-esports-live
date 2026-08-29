@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: polytrade-esports-live:0.4.0
+    image: polytrade-esports-live:0.5.0
     command:
       - python
       - -m
@@ -21,13 +21,11 @@ services:
       - "3"
       - --sports-max-age-seconds
       - "90"
-      # A fresh ledger for the grounded cohort. The previous account keeps its
-      # history: 95% of its trades were driven by priors later found to be
-      # paraphrases of the market, so mixing the two equity curves would leave
-      # neither readable. Positions opened under the old account still settle
-      # there, so that record stays complete.
+      # A fresh ledger for the final depth-sim cohort. Previous accounts keep
+      # their legacy instant-fill history, so execution quality and PnL are
+      # never mixed across incompatible simulation methods.
       - --account
-      - "grounded-paper"
+      - "execution-paper"
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -54,11 +52,54 @@ services:
         max-size: 10m
         max-file: "3"
 
+  # Strategies only create delayed IOC intents.  This worker is the sole path
+  # that fetches post-latency CLOB depth, creates fills, and moves cash or
+  # positions, so the paper ledger cannot accidentally fall back to instant
+  # top-of-book execution.
+  executor:
+    image: polytrade-esports-live:0.5.0
+    command:
+      - python
+      - -m
+      - polytrade_esports
+      - execute
+      - --db
+      - /app/data/esports_live.sqlite3
+      - --account
+      - "execution-paper"
+      - --interval-seconds
+      - "0.25"
+      - --timeout
+      - "5"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ./data:/app/data
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 192m
+    mem_reservation: 64m
+    cpus: 0.25
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+
   # Priors run in their own container so coverage no longer depends on a host
   # binary. A match is priced once, so a cycle that finds nothing new costs one
   # query and no API call.
   priors:
-    image: polytrade-esports-live:0.4.0
+    image: polytrade-esports-live:0.5.0
     command:
       - python
       - -m
@@ -112,7 +153,7 @@ services:
         max-file: "2"
 
   dashboard:
-    image: polytrade-esports-live:0.4.0
+    image: polytrade-esports-live:0.5.0
     command:
       - python
       - -m
@@ -121,7 +162,7 @@ services:
       - --db
       - /app/data/esports_live.sqlite3
       - --account
-      - "grounded-paper"
+      - "execution-paper"
       - --host
       - 0.0.0.0
       - --port

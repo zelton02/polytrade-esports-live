@@ -3,12 +3,14 @@ import json
 import os
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from .collector import CollectorConfig, run_loop
 from .dashboard import serve
 from .engine import tick
+from .executor import process_due_orders, run_executor_loop
 from .gamma import GammaClient, parse_event
 from .llm import (
     DEEPSEEK_API_KEY_ENV,
@@ -24,7 +26,7 @@ from .priors import run_priors
 from .resolver import resolve_open_matches
 from .scoring import score
 from .storage import Database
-from .timeutil import isoformat, utc_now
+from .timeutil import isoformat, parse_timestamp, utc_now
 from .types import BookQuote, LiveState, Match
 
 
@@ -72,8 +74,20 @@ def _paper_config(args: argparse.Namespace) -> PaperConfig:
     return PaperConfig(
         min_entry_edge=args.min_entry_edge,
         exit_edge=args.exit_edge,
+        max_market_drift=args.max_market_drift,
         max_match_fraction=args.max_match_fraction,
+        max_total_exposure_fraction=args.max_total_exposure_fraction,
+        max_open_positions=args.max_open_positions,
+        daily_loss_limit_fraction=args.daily_loss_limit_fraction,
         kelly_scale=args.kelly_scale,
+        latency_ms=args.execution_latency_ms,
+        latency_jitter_ms=args.execution_latency_jitter_ms,
+        order_ttl_seconds=args.order_ttl_seconds,
+        max_book_age_seconds=args.max_book_age_seconds,
+        max_slippage=args.max_slippage,
+        max_market_participation=args.max_market_participation,
+        taker_fee_rate=args.taker_fee_rate,
+        max_attempts=args.max_execution_attempts,
     )
 
 
@@ -99,6 +113,24 @@ def _event_state(match_id: str, event: Dict[str, Any], source: str) -> LiveState
 
 def _event_quote(match_id: str, event: Dict[str, Any], source: str) -> BookQuote:
     source_at = event.get("book_source_at", event["source_at"])
+    raw = dict(event)
+    if not isinstance(raw.get("A"), dict) or not isinstance(raw.get("B"), dict):
+        # Normalized JSONL predates depth capture.  Replays remain executable,
+        # but the synthetic liquidity is explicitly labelled and never used by
+        # the live worker.
+        size = float(event.get("synthetic_depth_shares", 10000.0))
+        raw = {
+            "A": {
+                "bids": [{"price": event["bid_a"], "size": size}],
+                "asks": [{"price": event["ask_a"], "size": size}],
+            },
+            "B": {
+                "bids": [{"price": event["bid_b"], "size": size}],
+                "asks": [{"price": event["ask_b"], "size": size}],
+            },
+            "synthetic_depth": True,
+            "event": event,
+        }
     return BookQuote(
         match_id=match_id,
         bid_a=float(event["bid_a"]),
@@ -108,7 +140,7 @@ def _event_quote(match_id: str, event: Dict[str, Any], source: str) -> BookQuote
         source_at=source_at,
         observed_at=event.get("book_observed_at", event.get("observed_at", source_at)),
         source=source,
-        raw=event,
+        raw=raw,
     )
 
 
@@ -189,17 +221,37 @@ def cmd_replay(args: argparse.Namespace) -> None:
     database = Database(args.db)
     database.initialize()
     results = []
+    executions = []
+    settings = _paper_config(args)
     for event in _read_jsonl(args.path):
+        quote = _event_quote(args.match_id, event, args.source)
+        decision_at = event.get("observed_at", event["source_at"])
         results.append(
             tick(
                 database,
                 _event_state(args.match_id, event, args.source),
-                _event_quote(args.match_id, event, args.source),
+                quote,
                 args.account,
-                _paper_config(args),
+                settings,
+                decision_at=decision_at,
             )
         )
-    _print({"ticks": len(results), "latest": results[-1] if results else None})
+        execute_at = parse_timestamp(decision_at) + timedelta(
+            milliseconds=settings.latency_ms + settings.latency_jitter_ms + 1
+        )
+        executions.append(
+            process_due_orders(
+                database,
+                args.account,
+                now=isoformat(execute_at),
+                supplied_quotes={args.match_id: quote},
+            ).to_dict()
+        )
+    _print({
+        "ticks": len(results),
+        "latest": results[-1] if results else None,
+        "executions": executions,
+    })
 
 
 def cmd_stream(args: argparse.Namespace) -> None:
@@ -236,17 +288,47 @@ def cmd_demo(args: argparse.Namespace) -> None:
             source="illustrative-replay",
         )
     )
+    database.apply_prior(
+        "demo-navi-m80",
+        {
+            "probability_team_a": 0.64,
+            "raw_probability_team_a": 0.64,
+            "confidence": "medium",
+            "reasoning_summary": "Illustrative pre-match prior for UI and replay validation.",
+            "key_factors": ["demo fixture", "frozen before replay"],
+            "supporting_evidence": [],
+            "assumptions": ["synthetic demonstration data"],
+            "evidence_cutoff_at": "2026-08-26T23:59:59Z",
+            "prompt_version": "demo-v1",
+            "usage": {},
+        },
+        provider="demo",
+        model="illustrative-prior",
+        backend="demo",
+        verified_facts="Illustrative fixture; not a research forecast.",
+        grounded_teams=2,
+    )
     example = Path(__file__).with_name("demo_series.jsonl")
     results = []
+    settings = PaperConfig(latency_ms=0, latency_jitter_ms=0)
     for event in _read_jsonl(str(example)):
+        quote = _event_quote("demo-navi-m80", event, "illustrative-replay")
+        decision_at = event.get("observed_at", event["source_at"])
         results.append(
             tick(
                 database,
                 _event_state("demo-navi-m80", event, "illustrative-replay"),
-                _event_quote("demo-navi-m80", event, "illustrative-replay"),
+                quote,
                 args.account,
-                PaperConfig(),
+                settings,
+                decision_at=decision_at,
             )
+        )
+        process_due_orders(
+            database,
+            args.account,
+            now=decision_at,
+            supplied_quotes={"demo-navi-m80": quote},
         )
     _print({"ticks": len(results), "database": args.db, "dashboard_port": 8788})
 
@@ -269,6 +351,26 @@ def cmd_status(args: argparse.Namespace) -> None:
     database = Database(args.db)
     database.initialize()
     _print(database.dashboard_payload(args.account))
+
+
+def cmd_execute(args: argparse.Namespace) -> None:
+    run_executor_loop(
+        Database(args.db),
+        account_name=args.account,
+        interval_seconds=args.interval_seconds,
+        cycles=args.cycles,
+        book_client=PolymarketBookClient(timeout=args.timeout),
+    )
+
+
+def cmd_kill_switch(args: argparse.Namespace) -> None:
+    database = Database(args.db)
+    database.initialize()
+    _print(
+        database.set_execution_kill_switch(
+            args.account, enabled=args.enable, reason=args.reason
+        )
+    )
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -500,8 +602,20 @@ def _add_paper_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--account", default="live-paper")
     parser.add_argument("--min-entry-edge", type=float, default=0.10)
     parser.add_argument("--exit-edge", type=float, default=0.00)
+    parser.add_argument("--max-market-drift", type=float, default=0.08)
     parser.add_argument("--max-match-fraction", type=float, default=0.01)
+    parser.add_argument("--max-total-exposure-fraction", type=float, default=0.05)
+    parser.add_argument("--max-open-positions", type=int, default=8)
+    parser.add_argument("--daily-loss-limit-fraction", type=float, default=0.03)
     parser.add_argument("--kelly-scale", type=float, default=0.25)
+    parser.add_argument("--execution-latency-ms", type=int, default=1250)
+    parser.add_argument("--execution-latency-jitter-ms", type=int, default=250)
+    parser.add_argument("--order-ttl-seconds", type=float, default=8.0)
+    parser.add_argument("--max-book-age-seconds", type=float, default=5.0)
+    parser.add_argument("--max-slippage", type=float, default=0.03)
+    parser.add_argument("--max-market-participation", type=float, default=0.10)
+    parser.add_argument("--taker-fee-rate", type=float, default=0.03)
+    parser.add_argument("--max-execution-attempts", type=int, default=3)
 
 
 def _add_state_arguments(parser: argparse.ArgumentParser) -> None:
@@ -605,6 +719,27 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--db", default=DEFAULT_DB)
     status.add_argument("--account", default="live-paper")
     status.set_defaults(func=cmd_status)
+
+    execute = subparsers.add_parser(
+        "execute", help="process delayed paper orders against fresh CLOB depth"
+    )
+    execute.add_argument("--db", default=DEFAULT_DB)
+    execute.add_argument("--account", default="execution-paper")
+    execute.add_argument("--interval-seconds", type=float, default=0.25)
+    execute.add_argument("--cycles", type=int, default=0)
+    execute.add_argument("--timeout", type=float, default=5.0)
+    execute.set_defaults(func=cmd_execute)
+
+    kill_switch = subparsers.add_parser(
+        "kill-switch", help="enable or disable new paper entries"
+    )
+    kill_switch.add_argument("--db", default=DEFAULT_DB)
+    kill_switch.add_argument("--account", default="execution-paper")
+    toggle = kill_switch.add_mutually_exclusive_group(required=True)
+    toggle.add_argument("--enable", action="store_true", dest="enable")
+    toggle.add_argument("--disable", action="store_false", dest="enable")
+    kill_switch.add_argument("--reason", default="manual")
+    kill_switch.set_defaults(func=cmd_kill_switch)
 
     dashboard = subparsers.add_parser("serve")
     dashboard.add_argument("--db", default=DEFAULT_DB)
