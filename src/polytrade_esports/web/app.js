@@ -514,20 +514,30 @@ function renderStrategies(strategies) {
     ["pre-match", "pre"],
     ["map-boundary", "map"],
     ["round-live", "round"],
+    ["maps-only-degraded", "degraded"],
   ].forEach(function (pair) {
     var item = byName[pair[0]] || {};
     var pnl = Number(item.total_pnl || 0);
+    var paperEnabled = item.paper_enabled === undefined
+      ? Number(item.decisions || 0)
+      : Number(item.paper_enabled || 0);
+    var forecasts = item.forecasts === undefined
+      ? paperEnabled
+      : Number(item.forecasts || 0);
     var pnlNode = document.getElementById("strategy-" + pair[1] + "-pnl");
     setNumber(pnlNode, pnl, signedMoney);
     setClass(pnlNode, pnl > 0 ? "up" : pnl < 0 ? "down" : "");
     setText(
       document.getElementById("strategy-" + pair[1] + "-meta"),
-      "DECISIONS " + whole(item.decisions || 0) + " · TRADES " + whole(item.trades || 0) +
-        " · REALIZED " + signedMoney(item.realized_pnl || 0)
+      "FORECAST " + whole(forecasts) + " · PAPER " + whole(paperEnabled) +
+        " · ENTRY " + whole(item.entry_enabled || 0)
     );
     setText(
       document.getElementById("strategy-" + pair[1] + "-open"),
-      "OPEN " + whole(item.open_positions || 0) + " · MARK " + money(item.mark_value || 0)
+      "SIGNAL " + whole(item.signals || 0) + " · ORDER " + whole(item.orders || 0) +
+        " · FILL " + whole(item.fills || 0) + " · TRADE " + whole(item.trades || 0) +
+        " · REALIZED " + signedMoney(item.realized_pnl || 0) +
+        " · OPEN " + whole(item.open_positions || 0)
     );
   });
 }

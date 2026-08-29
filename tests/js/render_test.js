@@ -432,21 +432,33 @@ const tests = {
     assert.ok(/\$0.74/.test(document.getElementById("exec-risk").textContent));
   },
 
-  "strategy cohorts report separate decisions trades and pnl"() {
+  "strategy cohorts report the depth-sim funnel and separate degraded data"() {
     const { context, document } = boot();
     const data = payload([match()]);
     data.account.strategies = [
-      { strategy: "pre-match", decisions: 8, trades: 2, realized_pnl: 1.2,
+      { strategy: "pre-match", forecasts: 10, paper_enabled: 8, entry_enabled: 7,
+        signals: 2, orders: 3, fills: 4, trades: 2, realized_pnl: 1.2,
         open_positions: 0, mark_value: 0, total_pnl: 1.2 },
-      { strategy: "map-boundary", decisions: 3, trades: 1, realized_pnl: -0.5,
+      { strategy: "map-boundary", forecasts: 3, paper_enabled: 3, entry_enabled: 3,
+        signals: 1, orders: 1, fills: 1, trades: 1, realized_pnl: -0.5,
         open_positions: 1, mark_value: 4, total_pnl: -0.2 },
-      { strategy: "round-live", decisions: 20, trades: 4, realized_pnl: 0,
+      { strategy: "round-live", forecasts: 20, paper_enabled: 18, entry_enabled: 16,
+        signals: 4, orders: 5, fills: 7, trades: 4, realized_pnl: 0,
         open_positions: 2, mark_value: 8.5, total_pnl: 0.75 },
+      { strategy: "maps-only-degraded", forecasts: 11, paper_enabled: 9,
+        entry_enabled: 0, signals: 1, orders: 1, fills: 1, trades: 1,
+        realized_pnl: 0, open_positions: 0, mark_value: 0, total_pnl: 0 },
     ];
     context.render(data);
     assert.strictEqual(document.getElementById("strategy-pre-pnl").textContent, "+$1.20");
-    assert.ok(/DECISIONS 20/.test(document.getElementById("strategy-round-meta").textContent));
+    assert.ok(/FORECAST 20 · PAPER 18 · ENTRY 16/.test(
+      document.getElementById("strategy-round-meta").textContent
+    ));
+    assert.ok(/SIGNAL 4 · ORDER 5 · FILL 7 · TRADE 4/.test(
+      document.getElementById("strategy-round-open").textContent
+    ));
     assert.ok(/OPEN 2/.test(document.getElementById("strategy-round-open").textContent));
+    assert.ok(/ENTRY 0/.test(document.getElementById("strategy-degraded-meta").textContent));
     assert.ok(document.getElementById("strategy-map-pnl").className.indexOf("down") >= 0);
   },
 

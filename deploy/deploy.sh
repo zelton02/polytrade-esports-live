@@ -1,11 +1,47 @@
 #!/usr/bin/env bash
-# Back up the live SQLite database, build the current source, restart all four
+# Back up the live SQLite database, build the current source, restart all five
 # services, and prove the public site is serving this exact deployment.
 set -euo pipefail
 
 fail() {
     echo "DEPLOY FAILED: $*" >&2
     exit 1
+}
+
+# SQLite's backup API restarts the copy whenever the source is written, so a
+# live collector/executor can starve it indefinitely on a busy database. Pause
+# the writers for the copy only. resume_writers is idempotent and runs from an
+# EXIT trap because --backup-only returns before the deploy would restart them.
+WRITER_SERVICES="collector executor priors shadow"
+PAUSED_WRITERS=""
+
+resume_writers() {
+    [ -n "$PAUSED_WRITERS" ] || return 0
+    local services="$PAUSED_WRITERS"
+    PAUSED_WRITERS=""
+    echo "resuming $services"
+    # shellcheck disable=SC2086
+    docker compose start $services >/dev/null 2>&1 || \
+        echo "WARNING: could not resume $services; start them manually" >&2
+}
+
+pause_writers() {
+    local service container running
+    PAUSED_WRITERS=""
+    for service in $WRITER_SERVICES; do
+        container="$(docker compose ps -q "$service" 2>/dev/null || true)"
+        [ -n "$container" ] || continue
+        running="$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || true)"
+        [ "$running" = "true" ] || continue
+        PAUSED_WRITERS="${PAUSED_WRITERS:+$PAUSED_WRITERS }$service"
+    done
+    [ -n "$PAUSED_WRITERS" ] || return 0
+    echo "pausing $PAUSED_WRITERS so the backup cannot be starved"
+    # shellcheck disable=SC2086
+    if ! docker compose stop $PAUSED_WRITERS >/dev/null 2>&1; then
+        resume_writers
+        fail "could not pause the writers before the backup"
+    fi
 }
 
 if [ -n "${PROJECT_ROOT:-}" ]; then
@@ -20,7 +56,7 @@ BACKUP_DIR="${BACKUP_DIR:-$PROJECT_ROOT/data/backups}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://esports.zhng.tech}"
 DEPLOY_GIT_SHA="${DEPLOY_GIT_SHA:-unknown}"
 ASSETS=(index.html app.js app.css detail.html detail.js)
-SERVICES=(collector executor priors dashboard)
+SERVICES=(collector executor priors shadow dashboard)
 
 MODE=deploy
 PREDEPLOY_BACKUP=""
@@ -61,10 +97,13 @@ create_backup() {
 
     echo "creating SQLite online backup $backup_path"
     umask 077
+    pause_writers
     if ! sqlite3 "$DATABASE_PATH" ".timeout 30000" ".backup '$backup_path'"; then
+        resume_writers
         rm -f -- "$backup_path"
         fail "SQLite .backup failed; deployment has not started"
     fi
+    resume_writers
     if ! integrity_check "$backup_path"; then
         rm -f -- "$backup_path"
         fail "backup integrity_check did not return ok; deployment has not started"
@@ -91,6 +130,8 @@ verify_existing_backup() {
     echo "PRE_DEPLOY_BACKUP=$backup_path"
 }
 
+trap resume_writers EXIT
+
 if [ -n "$PREDEPLOY_BACKUP" ]; then
     verify_existing_backup "$PREDEPLOY_BACKUP"
 else
@@ -101,12 +142,27 @@ if [ "$MODE" = "backup-only" ]; then
     exit 0
 fi
 
+# Version 0.6 starts a clean execution-paper-v2 cohort because its planner
+# suppresses risk-exhausted and dust orders differently. Do not strand risk in
+# the old cohort when collector/executor/dashboard switch accounts together.
+LEGACY_OPEN_POSITIONS="$(sqlite3 -readonly "$DATABASE_PATH" \
+    "SELECT count(*) FROM paper_positions p JOIN paper_accounts a USING(account_id) WHERE a.name='execution-paper' AND p.shares>0.000000001;")"
+LEGACY_ACTIVE_ORDERS="$(sqlite3 -readonly "$DATABASE_PATH" \
+    "SELECT count(*) FROM paper_orders o JOIN paper_accounts a USING(account_id) WHERE a.name='execution-paper' AND o.status IN ('PENDING','SUBMITTED');")"
+if [ "$LEGACY_OPEN_POSITIONS" -ne 0 ] || [ "$LEGACY_ACTIVE_ORDERS" -ne 0 ]; then
+    fail "execution-paper still has $LEGACY_OPEN_POSITIONS open positions and $LEGACY_ACTIVE_ORDERS active orders; wait for a clean v2 cohort cutover"
+fi
+echo "legacy execution-paper cohort is flat; v2 cutover is safe"
+
 TAG="$(grep -m1 -oE 'polytrade-esports-live:[0-9.]+' compose.yaml || true)"
 [ -n "$TAG" ] || fail "could not read the image tag from compose.yaml"
 if ! printf '%s\n' "$DEPLOY_GIT_SHA" | grep -Eq '^([0-9a-f]{40}|unknown)$'; then
     fail "DEPLOY_GIT_SHA must be the 40-character GitHub commit SHA"
 fi
-SOURCE_SHA="$(find src -type f -exec sha256sum {} + | sort -k2 | sha256sum | cut -c1-12)"
+# Bytecode is a build artifact, not source. Including it would make the same
+# source hash differently depending on whether anyone ran Python in the tree.
+SOURCE_SHA="$(find src -type f ! -name '*.py[cod]' -not -path '*/__pycache__/*' \
+    -exec sha256sum {} + | sort -k2 | sha256sum | cut -c1-12)"
 echo "building $TAG from Git commit $DEPLOY_GIT_SHA and source $SOURCE_SHA"
 if ! docker build \
     --build-arg "SOURCE_SHA=$SOURCE_SHA" \
@@ -115,7 +171,7 @@ if ! docker build \
     fail "Docker image build failed"
 fi
 
-echo "recreating collector, executor, priors, and dashboard"
+echo "recreating collector, executor, priors, shadow, and dashboard"
 if ! docker compose up -d --force-recreate; then
     fail "docker compose could not recreate the production services"
 fi
@@ -171,10 +227,10 @@ ROOT_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8788/)"
 integrity_check "$DATABASE_PATH" || fail "production database integrity_check did not return ok"
 SCHEMA_VERSION="$(sqlite3 -readonly "$DATABASE_PATH" \
     "SELECT value FROM metadata WHERE key='schema_version';")"
-[ "$SCHEMA_VERSION" = "6" ] || fail "metadata schema_version is $SCHEMA_VERSION instead of 6"
+[ "$SCHEMA_VERSION" = "7" ] || fail "metadata schema_version is $SCHEMA_VERSION instead of 7"
 ACCOUNT_COUNT="$(sqlite3 -readonly "$DATABASE_PATH" \
-    "SELECT count(*) FROM paper_accounts WHERE name IN ('live-paper','grounded-paper','execution-paper');")"
-[ "$ACCOUNT_COUNT" = "3" ] || fail "one or more protected paper accounts are missing"
+    "SELECT count(*) FROM paper_accounts WHERE name IN ('live-paper','grounded-paper','execution-paper','execution-paper-v2');")"
+[ "$ACCOUNT_COUNT" = "4" ] || fail "one or more protected paper accounts are missing"
 
 EXECUTOR_READY=0
 EXECUTOR_STATE="missing"
@@ -194,7 +250,7 @@ for _ in $(seq 1 30); do
 done
 [ "$EXECUTOR_READY" -eq 1 ] || \
     fail "executor status/heartbeat is not fresh: $EXECUTOR_STATE"
-echo "database integrity=ok schema=6 executor=$EXECUTOR_STATE"
+echo "database integrity=ok schema=7 executor=$EXECUTOR_STATE"
 
 ERROR_PATTERN='Traceback|Exception|FATAL|PANIC|(^|[[:space:]])ERROR([[:space:]:]|$)'
 for SERVICE in "${SERVICES[@]}"; do

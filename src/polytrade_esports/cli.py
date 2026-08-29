@@ -25,6 +25,7 @@ from .polymarket import PolymarketBookClient
 from .priors import run_priors
 from .resolver import resolve_open_matches
 from .scoring import score
+from .shadow_panel import run_shadow_panels
 from .storage import Database
 from .timeutil import isoformat, parse_timestamp, utc_now
 from .types import BookQuote, LiveState, Match
@@ -80,6 +81,8 @@ def _paper_config(args: argparse.Namespace) -> PaperConfig:
         max_open_positions=args.max_open_positions,
         daily_loss_limit_fraction=args.daily_loss_limit_fraction,
         kelly_scale=args.kelly_scale,
+        min_order_notional=args.min_order_notional,
+        rebalance_tolerance_fraction=args.rebalance_tolerance_fraction,
         latency_ms=args.execution_latency_ms,
         latency_jitter_ms=args.execution_latency_jitter_ms,
         order_ttl_seconds=args.order_ttl_seconds,
@@ -522,6 +525,75 @@ def cmd_forecast_priors(args: argparse.Namespace) -> None:
     _print({"summary": summary, "priors": created})
 
 
+def _run_shadow_panel_once(
+    database: Database, backend: Any, args: argparse.Namespace
+) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
+    return run_shadow_panels(
+        database=database,
+        backend=backend,
+        limit=args.limit,
+        daily_run_limit=args.daily_run_limit,
+        monthly_budget_usd=args.monthly_budget_usd,
+        max_cost_per_run=args.max_cost_per_run,
+        min_liquidity=args.min_liquidity,
+        min_lead_minutes=args.min_lead_minutes,
+        provider=args.provider,
+        model=args.model,
+        backend_name=args.backend,
+        dry_run=args.dry_run,
+        use_liquipedia=not args.cached_facts_only,
+        require_facts=not args.allow_ungrounded,
+    )
+
+
+def cmd_shadow_panel(args: argparse.Namespace) -> None:
+    """Run the isolated multi-role pre-match research cohort."""
+    database = Database(args.db)
+    if args.dry_run:
+        # Candidate inspection neither needs credentials nor makes a model
+        # request. Keeping that true makes --dry-run safe in fresh environments.
+        class DryRunBackend:
+            web_research = args.backend == "hermes"
+
+        backend: Any = DryRunBackend()
+    else:
+        backend = _prior_backend(args)
+    if args.loop_seconds > 0:
+        if args.dry_run:
+            raise ValueError("shadow-panel --dry-run cannot be combined with --loop-seconds")
+        while True:
+            try:
+                summary, runs = _run_shadow_panel_once(database, backend, args)
+                print(
+                    json.dumps(
+                        {
+                            "at": isoformat(utc_now()),
+                            "runs_created": summary["runs_created"],
+                            "candidates": summary["candidates_selected"],
+                            "month_cost_usd": round(
+                                summary["month_cost_before_run_usd"]
+                                + float(summary["usage"].get("estimated_cost_usd", 0.0)),
+                                4,
+                            ),
+                            "errors": summary["errors"][:3],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            except Exception as error:
+                print(
+                    json.dumps(
+                        {"at": isoformat(utc_now()), "error": str(error)},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            time.sleep(max(1.0, float(args.loop_seconds)))
+    summary, runs = _run_shadow_panel_once(database, backend, args)
+    _print({"summary": summary, "shadow_runs": runs})
+
+
 def cmd_resolve_open(args: argparse.Namespace) -> None:
     database = Database(args.db)
     result = resolve_open_matches(
@@ -608,6 +680,8 @@ def _add_paper_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-open-positions", type=int, default=8)
     parser.add_argument("--daily-loss-limit-fraction", type=float, default=0.03)
     parser.add_argument("--kelly-scale", type=float, default=0.25)
+    parser.add_argument("--min-order-notional", type=float, default=0.50)
+    parser.add_argument("--rebalance-tolerance-fraction", type=float, default=0.05)
     parser.add_argument("--execution-latency-ms", type=int, default=1250)
     parser.add_argument("--execution-latency-jitter-ms", type=int, default=250)
     parser.add_argument("--order-ttl-seconds", type=float, default=8.0)
@@ -724,7 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
         "execute", help="process delayed paper orders against fresh CLOB depth"
     )
     execute.add_argument("--db", default=DEFAULT_DB)
-    execute.add_argument("--account", default="execution-paper")
+    execute.add_argument("--account", default="execution-paper-v2")
     execute.add_argument("--interval-seconds", type=float, default=0.25)
     execute.add_argument("--cycles", type=int, default=0)
     execute.add_argument("--timeout", type=float, default=5.0)
@@ -734,7 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
         "kill-switch", help="enable or disable new paper entries"
     )
     kill_switch.add_argument("--db", default=DEFAULT_DB)
-    kill_switch.add_argument("--account", default="execution-paper")
+    kill_switch.add_argument("--account", default="execution-paper-v2")
     toggle = kill_switch.add_mutually_exclusive_group(required=True)
     toggle.add_argument("--enable", action="store_true", dest="enable")
     toggle.add_argument("--disable", action="store_false", dest="enable")
@@ -816,6 +890,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="run continuously at this interval instead of once",
     )
     priors.set_defaults(func=cmd_forecast_priors)
+
+    shadow = subparsers.add_parser(
+        "shadow-panel",
+        help="market-blind pre-match LLM panel; records research but never trades",
+    )
+    shadow.add_argument("--db", default=DEFAULT_DB)
+    shadow.add_argument(
+        "--limit", type=int, default=2, help="maximum panel runs this invocation"
+    )
+    shadow.add_argument(
+        "--daily-run-limit",
+        type=int,
+        default=10,
+        help="independent daily cap for shadow panel runs",
+    )
+    shadow.add_argument(
+        "--monthly-budget-usd",
+        type=float,
+        default=6.0,
+        help="shadow-only monthly budget; production prior spend is not counted",
+    )
+    shadow.add_argument(
+        "--max-cost-per-run",
+        type=float,
+        default=0.40,
+        help="stop a panel when its four-member cost reaches this guard",
+    )
+    shadow.add_argument("--min-liquidity", type=float, default=0.0)
+    shadow.add_argument(
+        "--min-lead-minutes",
+        type=float,
+        default=10.0,
+        help="do not start a four-member panel this close to match start",
+    )
+    shadow.add_argument(
+        "--backend",
+        choices=("deepseek", "hermes"),
+        default="deepseek",
+    )
+    shadow.add_argument("--api-key", default="", help="overrides $" + DEEPSEEK_API_KEY_ENV)
+    shadow.add_argument("--model", default=DEFAULT_MODEL)
+    shadow.add_argument("--provider", default=DEFAULT_PROVIDER)
+    shadow.add_argument("--hermes-bin", default="/usr/local/bin/hermes")
+    shadow.add_argument("--timeout", type=float, default=300.0)
+    shadow.add_argument(
+        "--allow-ungrounded",
+        action="store_true",
+        help="run even when no verified team facts are cached or fetched",
+    )
+    shadow.add_argument(
+        "--cached-facts-only",
+        action="store_true",
+        help="reuse stored team facts without a second Liquipedia requester",
+    )
+    shadow.add_argument("--dry-run", action="store_true")
+    shadow.add_argument(
+        "--loop-seconds",
+        type=float,
+        default=0.0,
+        help="run continuously at this interval instead of once",
+    )
+    shadow.set_defaults(func=cmd_shadow_panel)
 
     resolve_open = subparsers.add_parser(
         "resolve-open", help="settle finished matches from the Polymarket result"

@@ -83,6 +83,33 @@ class StylesheetTests(unittest.TestCase):
         self.assertIn("prefers-reduced-motion", self.css)
 
 
+class DashboardPayloadTests(unittest.TestCase):
+    def test_strategy_payload_exposes_depth_sim_funnel_and_degraded_cohort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(str(Path(directory) / "payload.sqlite3"))
+            database.initialize()
+            database.ensure_account("live-paper")
+            strategies = database.dashboard_payload()["account"]["strategies"]
+
+        self.assertEqual(
+            [item["strategy"] for item in strategies],
+            [
+                "pre-match",
+                "map-boundary",
+                "round-live",
+                "maps-only-degraded",
+            ],
+        )
+        for item in strategies:
+            self.assertEqual(item["scope"], "depth-sim")
+            self.assertTrue(
+                {
+                    "forecasts", "paper_enabled", "entry_enabled", "signals",
+                    "orders", "fills", "trades",
+                }.issubset(item)
+            )
+
+
 class DashboardAuthTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

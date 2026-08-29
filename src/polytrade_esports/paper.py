@@ -21,6 +21,10 @@ class PaperConfig:
     max_open_positions: int = 8
     daily_loss_limit_fraction: float = 0.03
     kelly_scale: float = 0.25
+    # Ordinary target adjustments below either floor are ignored. Forced
+    # exits (edge gone or side flip) deliberately bypass these churn filters.
+    min_order_notional: float = 0.50
+    rebalance_tolerance_fraction: float = 0.05
     latency_ms: int = 1250
     latency_jitter_ms: int = 250
     order_ttl_seconds: float = 8.0
@@ -47,6 +51,10 @@ class PaperConfig:
             raise ValueError("daily_loss_limit_fraction must be in (0, 1]")
         if not 0.0 < self.kelly_scale <= 1.0:
             raise ValueError("kelly_scale must be in (0, 1]")
+        if float(self.min_order_notional) < 0.0:
+            raise ValueError("min_order_notional cannot be negative")
+        if not 0.0 <= float(self.rebalance_tolerance_fraction) <= 1.0:
+            raise ValueError("rebalance_tolerance_fraction must be in [0, 1]")
         if int(self.latency_ms) < 0 or int(self.latency_jitter_ms) < 0:
             raise ValueError("execution latency cannot be negative")
         if int(self.latency_jitter_ms) > int(self.latency_ms):
@@ -136,6 +144,14 @@ def rebalance(
         if abs(float(market_drift)) > settings.max_market_drift:
             entry_side = None
 
+    # A forecast supersedes only orders that have not reached the simulated
+    # venue. A submitted order is owned by the executor and remains live. Do
+    # this before measuring committed exposure so superseded PENDING orders do
+    # not reserve risk budget forever.
+    database.cancel_pending_orders(
+        account_id, match_id, except_forecast_id=forecast_id
+    )
+
     with database.connect() as connection:
         account = connection.execute(
             "SELECT * FROM paper_accounts WHERE account_id=?", (account_id,)
@@ -147,6 +163,23 @@ def rebalance(
             """,
             (account_id, match_id),
         ).fetchall()
+        portfolio = connection.execute(
+            """
+            SELECT COALESCE(sum(shares*avg_cost), 0) AS open_cost
+            FROM paper_positions WHERE account_id=?
+            """,
+            (account_id,),
+        ).fetchone()
+        committed_rows = connection.execute(
+            """
+            SELECT match_id, outcome, requested_shares, limit_price
+            FROM paper_orders
+            WHERE account_id=? AND action='BUY'
+              AND status IN ('PENDING', 'SUBMITTED')
+              AND forecast_id<>?
+            """,
+            (account_id, forecast_id),
+        ).fetchall()
     positions: Dict[str, Dict[str, Any]] = {
         "A": {"shares": 0.0, "avg_cost": 0.0, "realized_pnl": 0.0,
               "entry_strategy": strategy, "execution_mode": "depth-sim"},
@@ -156,11 +189,45 @@ def rebalance(
     for row in rows:
         positions[str(row["outcome"])] = dict(row)
 
-    # A forecast supersedes only orders that have not reached the simulated
-    # venue.  A submitted order is owned by the executor and cannot be wished
-    # away by a newer model tick.
-    database.cancel_pending_orders(
-        account_id, match_id, except_forecast_id=forecast_id
+    committed_shares = {"A": 0.0, "B": 0.0}
+    committed_match_cost = 0.0
+    committed_portfolio_cost = 0.0
+    for row in committed_rows:
+        committed_price = float(row["limit_price"])
+        committed_unit_fee = (
+            settings.taker_fee_rate
+            * committed_price
+            * (1.0 - committed_price)
+        )
+        committed_cost = float(row["requested_shares"]) * (
+            committed_price + committed_unit_fee
+        )
+        committed_portfolio_cost += committed_cost
+        if str(row["match_id"]) == match_id:
+            committed_match_cost += committed_cost
+            outcome = str(row["outcome"])
+            if outcome in committed_shares:
+                committed_shares[outcome] += float(row["requested_shares"])
+
+    match_open_cost = sum(
+        float(positions[outcome].get("shares") or 0.0)
+        * float(positions[outcome].get("avg_cost") or 0.0)
+        for outcome in ("A", "B")
+    )
+    realized = sum(
+        float(positions[outcome].get("realized_pnl") or 0.0)
+        for outcome in ("A", "B")
+    )
+    max_loss = float(account["initial_cash"]) * settings.max_match_fraction
+    available_buy_budget = min(
+        float(account["cash"]) - committed_portfolio_cost,
+        max_loss + realized - match_open_cost - committed_match_cost,
+        (
+            float(account["initial_cash"])
+            * settings.max_total_exposure_fraction
+            - float(portfolio["open_cost"] or 0.0)
+            - committed_portfolio_cost
+        ),
     )
 
     planned: List[Dict[str, Any]] = []
@@ -242,17 +309,12 @@ def rebalance(
             add_order(outcome, "SELL", current_shares, "edge_gone")
 
     if entry_side is not None:
-        realized = sum(
-            float(positions[outcome].get("realized_pnl") or 0.0)
-            for outcome in ("A", "B")
-        )
         target_cost = _kelly_cost(
             float(account["initial_cash"]),
             probability[entry_side],
             ask[entry_side],
             settings,
         )
-        max_loss = float(account["initial_cash"]) * settings.max_match_fraction
         target_cost = min(target_cost, max(0.0, max_loss + realized))
         # Size against the all-in signal cost. Otherwise an order placed
         # exactly at the match-risk ceiling is guaranteed to be reported as a
@@ -269,16 +331,34 @@ def rebalance(
             ask[entry_side] + signal_unit_fee
         )
         current_shares = float(positions[entry_side].get("shares") or 0.0)
-        if target_shares > current_shares + 1e-9:
-            add_order(
-                entry_side, "BUY", target_shares - current_shares,
-                "entry_or_increase",
+        effective_shares = current_shares + committed_shares[entry_side]
+        adjustment_floor = max(
+            float(settings.min_order_notional),
+            target_cost * float(settings.rebalance_tolerance_fraction),
+        )
+        if target_shares > effective_shares + 1e-9:
+            desired_shares = target_shares - effective_shares
+            desired_cost = desired_shares * (
+                ask[entry_side] + signal_unit_fee
             )
+            # This is an advisory sizing/preflight check. The executor still
+            # re-reads cash, positions and both caps atomically at fill time.
+            order_cost = min(desired_cost, max(0.0, available_buy_budget))
+            if order_cost + 1e-9 >= adjustment_floor:
+                add_order(
+                    entry_side,
+                    "BUY",
+                    order_cost / (ask[entry_side] + signal_unit_fee),
+                    "entry_or_increase",
+                )
         elif current_shares > target_shares + 1e-9:
-            add_order(
-                entry_side, "SELL", current_shares - target_shares,
-                "target_reduction",
-            )
+            reduction_shares = current_shares - target_shares
+            reduction_notional = reduction_shares * bid[entry_side]
+            if reduction_notional + 1e-9 >= adjustment_floor:
+                add_order(
+                    entry_side, "SELL", reduction_shares,
+                    "target_reduction",
+                )
 
     return planned
 

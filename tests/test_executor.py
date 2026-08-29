@@ -263,29 +263,33 @@ class ExecutionSimulatorTests(unittest.TestCase):
             latency_jitter_ms=0,
             order_ttl_seconds=20,
             max_market_participation=1.0,
-            max_total_exposure_fraction=0.01,
+            max_total_exposure_fraction=0.02,
         )
         self.signal(config=config)
         self.execute()
-        with self.db.connect() as connection:
-            position = connection.execute(
-                "SELECT shares FROM paper_positions WHERE match_id='m1'"
-            ).fetchone()
-            connection.execute(
-                "UPDATE paper_positions SET avg_cost=? WHERE match_id='m1'",
-                (10.0 / float(position["shares"]),),
-            )
 
         later = isoformat(parse_timestamp(STAMP) + timedelta(seconds=1))
         self.db.add_match(Match("m2", "C", "D", 3, 0.70))
         quote = depth_quote(stamp=later, match_id="m2")
-        tick(
+        signalled = tick(
             self.db,
             LiveState("m2", later, 0, 0, 0, 0, observed_at=later),
             quote,
             paper_config=config,
             decision_at=later,
         )
+        self.assertTrue(signalled["paper_actions"])
+        # Simulate exposure changing after planning but before execution. The
+        # strategy precheck reduces obvious noise; the executor remains the
+        # authoritative gate for races and stale planner views.
+        with self.db.connect() as connection:
+            position = connection.execute(
+                "SELECT shares FROM paper_positions WHERE match_id='m1'"
+            ).fetchone()
+            connection.execute(
+                "UPDATE paper_positions SET avg_cost=? WHERE match_id='m1'",
+                (20.0 / float(position["shares"]),),
+            )
         batch = process_due_orders(
             self.db,
             "live-paper",

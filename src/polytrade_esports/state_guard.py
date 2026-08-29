@@ -14,7 +14,12 @@ from .types import LiveState
 
 
 FROZEN_SOURCE = "canonical-frozen"
-STRATEGIES = ("pre-match", "map-boundary", "round-live")
+STRATEGIES = (
+    "pre-match",
+    "map-boundary",
+    "round-live",
+    "maps-only-degraded",
+)
 
 
 @dataclass(frozen=True)
@@ -164,7 +169,10 @@ def strategy_for_state(
     if previous is not None and _map_advanced(previous, current):
         return "map-boundary"
     if not round_detail_available:
-        return "map-boundary"
+        # A missing round feed is an operating mode, not a completed-map
+        # decision.  Keep it separate so repeated degraded observations do not
+        # make the map-boundary strategy look more active than it really is.
+        return "maps-only-degraded"
     return "round-live"
 
 

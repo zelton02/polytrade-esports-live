@@ -67,7 +67,8 @@ sized from it.
   stop, stale/missing-book fail-closed behavior, retries with TTL, and a manual
   entry kill switch that still allows risk-reducing exits.
 - Keeps legacy instant-fill history in its old accounts and starts the final
-  simulator in a separate `execution-paper` ledger.
+  simulator in a separate `execution-paper-v2` ledger; the original
+  `execution-paper` cohort remains immutable for comparison.
 - Replays JSONL fixtures deterministically for research and tests.
 - Settles finished matches from the Polymarket result and scores the AI prior
   against the market baseline (Brier, log loss, hit rate).
@@ -78,7 +79,8 @@ sized from it.
 - Reports Sports WebSocket connection, message age, round coverage,
   placeholders, frozen states, and rejected transitions on the dashboard.
 - Attributes every forecast and paper trade to exactly one horizon:
-  `pre-match`, `map-boundary`, or `round-live`, with separate PnL summaries.
+  `pre-match`, `map-boundary`, `round-live`, or `maps-only-degraded`, with
+  separate activity funnels and PnL summaries.
 - Rejects future-dated source observations to reduce leakage risk.
 
 ## Live data sources
@@ -144,7 +146,7 @@ python3 -m polytrade_esports collect --db data/esports_live.sqlite3 --cycles 0 -
 
 # execute delayed orders from fresh CLOB depth (run as a separate process)
 python3 -m polytrade_esports execute \
-  --db data/esports_live.sqlite3 --account execution-paper
+  --db data/esports_live.sqlite3 --account execution-paper-v2
 
 # price upcoming matches with the LLM (see the candidates first)
 python3 -m polytrade_esports forecast-priors --db data/esports_live.sqlite3 --dry-run
@@ -211,6 +213,8 @@ The production defaults are deliberately conservative:
 | Total open-cost ceiling | 5% of initial bankroll |
 | Maximum open positions | 8 |
 | Daily realized-loss stop | 3% of initial bankroll |
+| Minimum ordinary rebalance | $0.50 all-in notional |
+| Rebalance deadband | 5% of target cost |
 | Market-data attempts | 3 |
 
 Missing depth, a stale book, an unavailable token, an expired order, a closed
@@ -220,16 +224,24 @@ fees and rejection mix. To stop new entries without trapping existing risk:
 
 ```bash
 python3 -m polytrade_esports kill-switch \
-  --db data/esports_live.sqlite3 --account execution-paper \
+  --db data/esports_live.sqlite3 --account execution-paper-v2 \
   --enable --reason "operator review"
 
 python3 -m polytrade_esports kill-switch \
-  --db data/esports_live.sqlite3 --account execution-paper --disable
+  --db data/esports_live.sqlite3 --account execution-paper-v2 --disable
 ```
 
 `replay` and `demo` use the same matching, fee, position and risk code. Old
 BBO-only fixtures receive explicitly labelled synthetic depth for compatibility;
-they are not mixed with the live `execution-paper` cohort.
+they are not mixed with the live `execution-paper-v2` cohort.
+
+The strategy planner reserves risk for BUY orders that are already `PENDING` or
+`SUBMITTED`, and suppresses a new BUY when cash, match cost or portfolio cost is
+already exhausted. This is an advisory noise filter only: the executor repeats
+the authoritative checks atomically against the post-latency book. Ordinary
+target changes below either the $0.50 floor or 5% deadband wait for a material
+move; `edge_gone` and `side_flip` exits bypass both controls so dust can never
+trap risk.
 
 ## The stale-model guard
 
@@ -281,14 +293,19 @@ Strategy labels describe the information horizon used for each decision:
 | Label | Meaning |
 |---|---|
 | `pre-match` | Match has not started; only the frozen prior and current book are available |
-| `map-boundary` | Live decision from a completed-map transition or maps-only feed |
+| `map-boundary` | Live decision from an observed completed-map transition |
 | `round-live` | Live decision from an accepted round-level snapshot |
+| `maps-only-degraded` | Live observation without trusted round detail; new entries are paused |
 
 Paper positions keep their opening strategy even if a later horizon reduces or
-settles them. The dashboard reports depth-sim-eligible decisions and trades
-by decision horizon, while realized/open PnL is attributed to the strategy that
-opened the exposure. Forecasts written before this eligibility flag existed are
-kept for audit but excluded from decision counts rather than guessed into them.
+settles them. The dashboard reports the depth-sim funnel separately as
+forecasts, paper-enabled forecasts, entry-enabled forecasts, signals, orders,
+fills, and trades. Realized/open PnL remains attributed to the strategy that
+opened the exposure. Forecasts written before the depth-sim eligibility flags
+existed are kept for audit but excluded from this funnel rather than guessed
+into it. A signal is one distinct forecast that persisted at least one paper
+order intent; one signal can create multiple orders, and one order can consume
+multiple depth levels (fills).
 
 ## Known follow-ups
 
@@ -463,19 +480,53 @@ nothing.
 
 Measured costs are above. On the direct API a prior is ~$0.0013, so the whole
 board can be priced for well under a dollar a day; the deployed `priors`
-container loops every 15 minutes with `--limit 12 --daily-limit 200` under a
+container loops every 15 minutes with `--limit 3 --daily-limit 200` under a
 $3/month cap. A match is priced once, so a cycle that finds nothing new costs a
 single query and no API call.
 
 Set the cap below the account balance, not above it: the guard stops spending at
 the cap, but it cannot stop a call failing when the account is empty.
 
+## Market-blind shadow panel
+
+`shadow-panel` runs four independent pre-match roles beside the production
+prior: a team-A case, a team-B case, an outside-view base-rate analyst, and a
+skeptic/auditor. Members cannot see market context, prices, liquidity, tokens,
+the production prior, the other members, or the consensus. A deterministic
+median produces the shadow point estimate; median absolute deviation and the
+full member range record disagreement without pretending it is a statistical
+confidence interval.
+
+Shadow results live in dedicated tables whose `applied` column is constrained
+to zero. The runner never calls the production prior, forecast, paper or order
+paths, so its output cannot trade. The market midpoint is fetched only after
+the members finish and stored separately for later comparison.
+
+```bash
+python3 -m polytrade_esports shadow-panel \
+  --db data/esports_live.sqlite3 --backend deepseek \
+  --model deepseek-v4-flash --limit 1 \
+  --daily-run-limit 20 --monthly-budget-usd 1.0 \
+  --max-cost-per-run 0.01 --min-lead-minutes 10 \
+  --cached-facts-only --dry-run
+```
+
+The deployed shadow worker loops every 15 minutes, uses only facts already
+cached by the production prior worker, and refuses to start a four-member panel
+inside ten minutes of scheduled match start. Its daily and monthly budgets are
+independent of production-prior spend.
+
 ## Deployment
 
-`compose.yaml` runs four containers: collector, execution worker, DeepSeek prior
-loop, and a read-only dashboard on `127.0.0.1:8788`. All are unprivileged,
-read-only-rootfs and resource-capped. `deploy/` also contains the optional Hermes
-prior timer and the Cloudflare tunnel unit.
+`compose.yaml` runs five containers: collector, execution worker, DeepSeek prior
+loop, market-blind shadow panel, and a read-only dashboard on `127.0.0.1:8788`.
+All are unprivileged, read-only-rootfs and resource-capped. `deploy/` also
+contains the optional Hermes prior timer and the Cloudflare tunnel unit.
+
+The deploy script refuses the `execution-paper-v2` cutover while the original
+`execution-paper` account still has an open position or an active order. All
+three account consumers switch together only after the legacy cohort is flat,
+so no position is abandoned merely to obtain cleaner experiment attribution.
 
 ```bash
 chown -R 10002:10002 data      # the container runs as uid 10002

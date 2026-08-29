@@ -5,6 +5,7 @@ from pathlib import Path
 
 from polytrade_esports.engine import tick
 from polytrade_esports.executor import process_due_orders
+from polytrade_esports.paper import PaperConfig
 from polytrade_esports.storage import Database
 from polytrade_esports.timeutil import isoformat, parse_timestamp, utc_now
 from polytrade_esports.types import BookQuote, LiveState, Match
@@ -77,6 +78,12 @@ class EnginePaperTests(unittest.TestCase):
         cohort = next(
             item for item in account["strategies"] if item["strategy"] == "round-live"
         )
+        self.assertEqual(cohort["forecasts"], 1)
+        self.assertEqual(cohort["paper_enabled"], 1)
+        self.assertEqual(cohort["entry_enabled"], 1)
+        self.assertEqual(cohort["signals"], 1)
+        self.assertEqual(cohort["orders"], 1)
+        self.assertEqual(cohort["fills"], 1)
         self.assertEqual(cohort["decisions"], 1)
         self.assertEqual(cohort["trades"], 1)
         self.assertEqual(cohort["open_positions"], 1)
@@ -92,6 +99,10 @@ class EnginePaperTests(unittest.TestCase):
             item for item in self.db.strategy_summary()
             if item["strategy"] == "round-live"
         )
+        self.assertEqual(cohort["forecasts"], 1)
+        self.assertEqual(cohort["paper_enabled"], 0)
+        self.assertEqual(cohort["entry_enabled"], 0)
+        self.assertEqual(cohort["signals"], 0)
         self.assertEqual(cohort["decisions"], 0)
         self.assertEqual(cohort["trades"], 0)
 
@@ -147,10 +158,202 @@ class EnginePaperTests(unittest.TestCase):
         later_stamp = "2026-08-27T00:05:00Z"
         stronger = LiveState("m1", later_stamp, 1, 1, 8, 5, economy_a=1, economy_b=-1, observed_at=later_stamp)
         cheaper_book = BookQuote("m1", 0.28, 0.30, 0.70, 0.72, later_stamp, observed_at=later_stamp)
-        tick(self.db, stronger, cheaper_book)
+        result = tick(self.db, stronger, cheaper_book)
+        self.assertFalse(
+            any(action["action"] == "BUY" for action in result["paper_actions"])
+        )
         account = self.db.account_payload()
         open_cost = sum(item["shares"] * item["avg_cost"] for item in account["positions"])
         self.assertLessEqual(open_cost, 10.0 + 1e-8)
+
+    def test_submitted_buy_reserves_budget_without_being_cancelled(self):
+        config = PaperConfig(
+            min_order_notional=0.0,
+            rebalance_tolerance_fraction=0.0,
+            latency_ms=0,
+            latency_jitter_ms=0,
+        )
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        first = tick(
+            self.db, state, quote, paper_config=config, decision_at=STAMP
+        )
+        order_id = first["paper_actions"][0]["order_id"]
+        self.assertIsNotNone(self.db.claim_order(order_id, STAMP))
+
+        later = "2026-08-27T00:01:00Z"
+        result = tick(
+            self.db,
+            LiveState("m1", later, 0, 0, 0, 0, observed_at=later),
+            BookQuote("m1", 0.48, 0.50, 0.50, 0.52, later, observed_at=later),
+            paper_config=config,
+            decision_at=later,
+        )
+        self.assertEqual(result["paper_actions"], [])
+        with self.db.connect() as connection:
+            orders = connection.execute(
+                "SELECT order_id, status FROM paper_orders ORDER BY order_id"
+            ).fetchall()
+        self.assertEqual(
+            [(row["order_id"], row["status"]) for row in orders],
+            [(order_id, "SUBMITTED")],
+        )
+
+    def test_full_portfolio_budget_does_not_create_an_impossible_buy(self):
+        config = PaperConfig(
+            max_total_exposure_fraction=0.01,
+            min_order_notional=0.0,
+            rebalance_tolerance_fraction=0.0,
+        )
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        quote = BookQuote("m1", 0.48, 0.50, 0.50, 0.52, STAMP, observed_at=STAMP)
+        tick(self.db, state, quote, paper_config=config)
+        execute_quote(self.db, quote)
+        with self.db.connect() as connection:
+            position = connection.execute(
+                "SELECT shares FROM paper_positions WHERE match_id='m1'"
+            ).fetchone()
+            connection.execute(
+                "UPDATE paper_positions SET avg_cost=? WHERE match_id='m1'",
+                (10.0 / float(position["shares"]),),
+            )
+
+        later = "2026-08-27T00:01:00Z"
+        self.db.add_match(Match("m2", "C", "D", 3, 0.70))
+        result = tick(
+            self.db,
+            LiveState("m2", later, 0, 0, 0, 0, observed_at=later),
+            BookQuote("m2", 0.48, 0.50, 0.50, 0.52, later, observed_at=later),
+            paper_config=config,
+        )
+        self.assertEqual(result["paper_actions"], [])
+        with self.db.connect() as connection:
+            m2_orders = connection.execute(
+                "SELECT count(*) FROM paper_orders WHERE match_id='m2'"
+            ).fetchone()[0]
+        self.assertEqual(m2_orders, 0)
+
+    def test_minimum_notional_suppresses_only_tiny_target_adjustments(self):
+        config = PaperConfig(
+            max_match_fraction=0.02,
+            kelly_scale=0.025,
+            min_order_notional=0.50,
+            rebalance_tolerance_fraction=0.0,
+        )
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        opening = BookQuote("m1", 0.49, 0.50, 0.50, 0.51, STAMP, observed_at=STAMP)
+        tick(self.db, state, opening, paper_config=config)
+        execute_quote(self.db, opening)
+
+        near = "2026-08-27T00:01:00Z"
+        small_move = BookQuote(
+            "m1", 0.495, 0.505, 0.495, 0.505, near, observed_at=near
+        )
+        quiet = tick(
+            self.db,
+            LiveState("m1", near, 0, 0, 0, 0, observed_at=near),
+            small_move,
+            paper_config=config,
+        )
+        self.assertEqual(quiet["paper_actions"], [])
+
+        later = "2026-08-27T00:02:00Z"
+        lower_floor = PaperConfig(
+            max_match_fraction=0.02,
+            kelly_scale=0.025,
+            min_order_notional=0.10,
+            rebalance_tolerance_fraction=0.0,
+        )
+        adjusted = tick(
+            self.db,
+            LiveState("m1", later, 0, 0, 0, 0, observed_at=later),
+            BookQuote(
+                "m1", 0.495, 0.505, 0.495, 0.505, later, observed_at=later
+            ),
+            paper_config=lower_floor,
+        )
+        self.assertTrue(
+            any(
+                action["reason"] == "target_reduction"
+                for action in adjusted["paper_actions"]
+            )
+        )
+
+    def test_small_target_adjustments_wait_inside_the_deadband(self):
+        config = PaperConfig(
+            max_match_fraction=0.02,
+            kelly_scale=0.025,
+            min_order_notional=0.0,
+            rebalance_tolerance_fraction=0.05,
+        )
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        opening = BookQuote("m1", 0.49, 0.50, 0.50, 0.51, STAMP, observed_at=STAMP)
+        tick(self.db, state, opening, paper_config=config)
+        execute_quote(self.db, opening)
+
+        near = "2026-08-27T00:01:00Z"
+        small_move = BookQuote(
+            "m1", 0.495, 0.505, 0.495, 0.505, near, observed_at=near
+        )
+        quiet = tick(
+            self.db,
+            LiveState("m1", near, 0, 0, 0, 0, observed_at=near),
+            small_move,
+            paper_config=config,
+        )
+        self.assertEqual(quiet["paper_actions"], [])
+
+        farther = "2026-08-27T00:02:00Z"
+        material_move = BookQuote(
+            "m1", 0.54, 0.55, 0.45, 0.46, farther, observed_at=farther
+        )
+        material = tick(
+            self.db,
+            LiveState("m1", farther, 0, 0, 0, 0, observed_at=farther),
+            material_move,
+            paper_config=config,
+        )
+        self.assertTrue(
+            any(
+                action["action"] == "SELL"
+                and action["reason"] == "target_reduction"
+                for action in material["paper_actions"]
+            )
+        )
+
+    def test_minimum_notional_never_blocks_a_forced_exit(self):
+        opening_config = PaperConfig(
+            max_match_fraction=0.0003,
+            min_order_notional=0.0,
+            rebalance_tolerance_fraction=0.0,
+        )
+        state = LiveState("m1", STAMP, 0, 0, 0, 0, observed_at=STAMP)
+        opening = BookQuote("m1", 0.49, 0.50, 0.50, 0.51, STAMP, observed_at=STAMP)
+        tick(self.db, state, opening, paper_config=opening_config)
+        execute_quote(self.db, opening)
+
+        later = "2026-08-27T00:01:00Z"
+        exit_quote = BookQuote(
+            "m1", 0.71, 0.72, 0.28, 0.29, later, observed_at=later
+        )
+        result = tick(
+            self.db,
+            LiveState("m1", later, 0, 0, 0, 0, observed_at=later),
+            exit_quote,
+            paper_config=PaperConfig(min_order_notional=10.0),
+        )
+        exits = [
+            action for action in result["paper_actions"]
+            if action["action"] == "SELL" and action["reason"] == "edge_gone"
+        ]
+        self.assertEqual(len(exits), 1)
+        self.assertLess(exits[0]["shares"] * exits[0]["signal_price"], 0.50)
+
+    def test_noise_controls_reject_invalid_values(self):
+        with self.assertRaisesRegex(ValueError, "min_order_notional"):
+            PaperConfig(min_order_notional=-0.01).validate()
+        with self.assertRaisesRegex(ValueError, "rebalance_tolerance_fraction"):
+            PaperConfig(rebalance_tolerance_fraction=1.01).validate()
 
 
 if __name__ == "__main__":

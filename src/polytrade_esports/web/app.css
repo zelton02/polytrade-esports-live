@@ -394,7 +394,7 @@ main { position: relative; z-index: 2; padding: 0 var(--gut) 56px; }
 /* Strategy attribution -------------------------------------------------- */
 
 .strategygrid {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1px; padding: 1px; background: var(--line);
 }
 .strategycard { min-width: 0; background: var(--panel); padding: 14px; }
@@ -469,6 +469,7 @@ tbody tr:hover td { background: rgba(63,240,168,0.03); }
   .feedrail { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .feedcell:nth-child(3n+1) { border-left: 0; }
   .feedcell:nth-child(n+4) { border-top: 1px solid var(--line); }
+  .strategygrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 620px) {
   .rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }

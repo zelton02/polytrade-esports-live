@@ -4,6 +4,7 @@ from polytrade_esports.state_guard import (
     FROZEN_SOURCE,
     canonicalize_state,
     strategy_for_state,
+    validate_strategy,
 )
 from polytrade_esports.types import LiveState
 
@@ -72,6 +73,29 @@ class CanonicalStateGuardTests(unittest.TestCase):
         self.assertEqual(strategy_for_state(False, None, first, False), "pre-match")
         self.assertEqual(strategy_for_state(True, first, next_map, True), "map-boundary")
         self.assertEqual(strategy_for_state(True, first, first, True), "round-live")
+        self.assertEqual(
+            strategy_for_state(True, first, first, False),
+            "maps-only-degraded",
+        )
+
+    def test_true_map_boundary_wins_over_maps_only_degradation(self):
+        first = state("2026-08-29T00:00:00Z")
+        next_map = state(
+            "2026-08-29T00:01:00Z", maps=(1, 0), current_map="Map 2",
+            source="polymarket-sports-ws-maps",
+        )
+        self.assertEqual(
+            strategy_for_state(True, first, next_map, False),
+            "map-boundary",
+        )
+
+    def test_degraded_strategy_is_validated_but_unknown_labels_are_not(self):
+        self.assertEqual(
+            validate_strategy("MAPS-ONLY-DEGRADED"),
+            "maps-only-degraded",
+        )
+        with self.assertRaises(ValueError):
+            validate_strategy("live-ish")
 
 
 if __name__ == "__main__":

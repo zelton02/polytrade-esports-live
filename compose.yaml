@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: polytrade-esports-live:0.5.0
+    image: polytrade-esports-live:0.6.0
     command:
       - python
       - -m
@@ -25,7 +25,7 @@ services:
       # their legacy instant-fill history, so execution quality and PnL are
       # never mixed across incompatible simulation methods.
       - --account
-      - "execution-paper"
+      - "execution-paper-v2"
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -57,7 +57,7 @@ services:
   # positions, so the paper ledger cannot accidentally fall back to instant
   # top-of-book execution.
   executor:
-    image: polytrade-esports-live:0.5.0
+    image: polytrade-esports-live:0.6.0
     command:
       - python
       - -m
@@ -66,7 +66,7 @@ services:
       - --db
       - /app/data/esports_live.sqlite3
       - --account
-      - "execution-paper"
+      - "execution-paper-v2"
       - --interval-seconds
       - "0.25"
       - --timeout
@@ -99,7 +99,7 @@ services:
   # binary. A match is priced once, so a cycle that finds nothing new costs one
   # query and no API call.
   priors:
-    image: polytrade-esports-live:0.5.0
+    image: polytrade-esports-live:0.6.0
     command:
       - python
       - -m
@@ -152,8 +152,65 @@ services:
         max-size: 5m
         max-file: "2"
 
+  # Four independent, market-blind pre-match roles write only to the shadow
+  # research tables. They cannot promote a prior or create an order. Reuse the
+  # priors worker's cached facts so two containers do not independently spend
+  # Liquipedia's per-IP request budget.
+  shadow:
+    image: polytrade-esports-live:0.6.0
+    command:
+      - python
+      - -m
+      - polytrade_esports
+      - shadow-panel
+      - --db
+      - /app/data/esports_live.sqlite3
+      - --backend
+      - deepseek
+      - --model
+      - deepseek-v4-pro
+      - --loop-seconds
+      - "900"
+      - --limit
+      - "1"
+      - --daily-run-limit
+      - "20"
+      - --monthly-budget-usd
+      - "1.0"
+      - --max-cost-per-run
+      - "0.01"
+      - --min-liquidity
+      - "20000"
+      - --min-lead-minutes
+      - "10"
+      - --cached-facts-only
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ./data:/app/data
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 192m
+    mem_reservation: 64m
+    cpus: 0.25
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
   dashboard:
-    image: polytrade-esports-live:0.5.0
+    image: polytrade-esports-live:0.6.0
     command:
       - python
       - -m
@@ -162,7 +219,7 @@ services:
       - --db
       - /app/data/esports_live.sqlite3
       - --account
-      - "execution-paper"
+      - "execution-paper-v2"
       - --host
       - 0.0.0.0
       - --port

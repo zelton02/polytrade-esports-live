@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from .timeutil import canonical_timestamp, isoformat, parse_timestamp, utc_now
 from .types import BookQuote, LiveState, Match
-from .state_guard import STRATEGIES, validate_strategy
+from .state_guard import STRATEGIES, strategy_for_state, validate_strategy
 
 
 EXECUTION_MODES = ("legacy", "depth-sim")
@@ -324,6 +324,75 @@ CREATE TABLE IF NOT EXISTS executor_status (
 );
 """
 
+# Shadow research has a deliberately separate ledger.  Nothing in the paper
+# engine joins these tables, and the CHECK constraints make the non-applied
+# boundary inspectable in the database rather than merely a caller convention.
+# CREATE IF NOT EXISTS keeps this compatible with every prior SQLite version;
+# the coordinated release owns the metadata schema-version bump.
+SCHEMA_SHADOW_PANEL = """
+CREATE TABLE IF NOT EXISTS shadow_panel_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    match_id TEXT NOT NULL REFERENCES matches(match_id),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    evidence_cutoff_at TEXT NOT NULL,
+    panel_version TEXT NOT NULL,
+    consensus_method TEXT NOT NULL DEFAULT 'median-with-mad-band-v1',
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    grounded_teams INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'completed', 'partial', 'failed')),
+    successful_members INTEGER NOT NULL DEFAULT 0,
+    consensus_probability_a REAL
+        CHECK (consensus_probability_a IS NULL OR
+               (consensus_probability_a > 0 AND consensus_probability_a < 1)),
+    uncertainty_low_a REAL,
+    uncertainty_high_a REAL,
+    probability_spread REAL,
+    probability_mad REAL,
+    market_probability_a REAL,
+    market_captured_at TEXT,
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    applied INTEGER NOT NULL DEFAULT 0 CHECK (applied = 0),
+    UNIQUE(match_id, panel_version, model, backend)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_panel_runs_time
+ON shadow_panel_runs(created_at, match_id);
+
+CREATE TABLE IF NOT EXISTS shadow_panel_members (
+    member_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES shadow_panel_runs(run_id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+    prompt_sha256 TEXT NOT NULL,
+    probability_a REAL
+        CHECK (probability_a IS NULL OR (probability_a > 0 AND probability_a < 1)),
+    raw_probability_a REAL,
+    confidence TEXT CHECK (
+        confidence IS NULL OR confidence IN ('low', 'medium', 'high')
+    ),
+    reasoning_summary TEXT NOT NULL DEFAULT '',
+    key_factors_json TEXT NOT NULL DEFAULT '[]',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    assumptions_json TEXT NOT NULL DEFAULT '[]',
+    raw_response TEXT NOT NULL DEFAULT '',
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    applied INTEGER NOT NULL DEFAULT 0 CHECK (applied = 0),
+    UNIQUE(run_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shadow_panel_members_run
+ON shadow_panel_members(run_id, member_id);
+"""
+
 # The market's own probability at the instant the prior was made. Scoring the
 # AI against a price sampled at some other moment is not a fair comparison.
 PRIOR_COLUMNS = (
@@ -451,6 +520,7 @@ class Database:
             connection.executescript(SCHEMA)
             connection.executescript(SCHEMA_V2)
             connection.executescript(SCHEMA_V6)
+            connection.executescript(SCHEMA_SHADOW_PANEL)
             version_row = connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
@@ -482,9 +552,19 @@ class Database:
             self._backfill_web_grounding(connection)
             if previous_version < 4:
                 self._backfill_strategy_attribution(connection)
+            repair = connection.execute(
+                "SELECT value FROM metadata "
+                "WHERE key='backfill_maps_only_degraded_v1'"
+            ).fetchone()
+            if repair is None:
+                self._backfill_maps_only_degraded_attribution(connection)
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                    ("backfill_maps_only_degraded_v1", "complete"),
+                )
             connection.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
-                ("schema_version", "6"),
+                ("schema_version", "7"),
             )
 
     @staticmethod
@@ -550,6 +630,95 @@ class Database:
             ), 'pre-match')
             """
         )
+
+    @staticmethod
+    def _backfill_maps_only_degraded_attribution(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Split provably degraded depth-sim rows from real map transitions.
+
+        Version 6 called every no-round live observation ``map-boundary``.  A
+        blind SQL rewrite based only on the provider name would also relabel a
+        real transition delivered by that provider.  Replay the recorded
+        forecast states in order and reuse the live classifier instead.  Only
+        the depth-sim cohort is touched: older legacy forecasts were never
+        proven paper-eligible and are excluded from the strategy dashboard.
+        """
+        rows = connection.execute(
+            """
+            SELECT f.forecast_id, f.match_id, f.forecast_at, f.strategy,
+                   s.source_at, s.observed_at, s.maps_a, s.maps_b,
+                   s.rounds_a, s.rounds_b, s.current_map,
+                   s.side_advantage_a, s.economy_a, s.economy_b,
+                   s.map_bias_a, s.source, s.raw_json
+            FROM forecasts f
+            JOIN state_snapshots s ON s.state_id=f.state_id
+            WHERE f.execution_mode='depth-sim'
+            ORDER BY f.match_id, f.forecast_at, f.forecast_id
+            """
+        ).fetchall()
+        previous_by_match: Dict[str, LiveState] = {}
+        rewritten: List[int] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raw = {}
+            state = LiveState(
+                match_id=row["match_id"],
+                source_at=row["source_at"],
+                observed_at=row["observed_at"],
+                maps_a=row["maps_a"],
+                maps_b=row["maps_b"],
+                rounds_a=row["rounds_a"],
+                rounds_b=row["rounds_b"],
+                current_map=row["current_map"],
+                side_advantage_a=row["side_advantage_a"],
+                economy_a=row["economy_a"],
+                economy_b=row["economy_b"],
+                map_bias_a=row["map_bias_a"],
+                source=row["source"],
+                raw=raw,
+            )
+            previous = previous_by_match.get(str(row["match_id"]))
+            guard = raw.get("canonical_guard") or {}
+            degraded_source = (
+                str(row["source"] or "").endswith("-maps")
+                or raw.get("round_detail_available") is False
+                or guard.get("reason") == "round_detail_unavailable"
+            )
+            if (
+                row["strategy"] == "map-boundary"
+                # Without an earlier depth-sim forecast there is no recorded
+                # comparison that can disprove a real map transition. Keep
+                # that first observation untouched rather than guessing.
+                and previous is not None
+                and degraded_source
+                and strategy_for_state(True, previous, state, False)
+                    == "maps-only-degraded"
+            ):
+                rewritten.append(int(row["forecast_id"]))
+            previous_by_match[str(row["match_id"])] = state
+
+        for forecast_id in rewritten:
+            connection.execute(
+                "UPDATE forecasts SET strategy='maps-only-degraded' "
+                "WHERE forecast_id=?",
+                (forecast_id,),
+            )
+            # Decision attribution follows the forecast. Entry attribution
+            # deliberately does not: degraded observations can close a
+            # position, but cannot become the strategy that opened it.
+            connection.execute(
+                "UPDATE paper_orders SET decision_strategy='maps-only-degraded' "
+                "WHERE forecast_id=? AND execution_mode='depth-sim'",
+                (forecast_id,),
+            )
+            connection.execute(
+                "UPDATE paper_trades SET decision_strategy='maps-only-degraded' "
+                "WHERE forecast_id=? AND execution_mode='depth-sim'",
+                (forecast_id,),
+            )
 
     @staticmethod
     def _label_legacy_backends(connection: sqlite3.Connection) -> None:
@@ -1703,6 +1872,264 @@ class Database:
                 ).fetchone()[0]
             )
 
+    def matches_needing_shadow_panel(
+        self,
+        panel_version: str,
+        model: str,
+        backend: str,
+        limit: int = 10,
+        min_liquidity: float = 0.0,
+        min_lead_minutes: float = 10.0,
+    ) -> List[Dict[str, Any]]:
+        """Return upcoming fixtures that have not entered this shadow cohort.
+
+        This selection is independent of ``prior_source``: the experiment is
+        meant to run beside either a seed or a production LLM prior.  It never
+        changes the production pricing queue.
+        """
+        if float(min_lead_minutes) < 0.0:
+            raise ValueError("shadow panel min_lead_minutes cannot be negative")
+        # Four independent calls can take minutes. Unlike the production prior
+        # queue, the shadow cohort gets no schedule grace: every member must
+        # finish from an indisputably pre-match information set.
+        cutoff = isoformat(
+            utc_now() + timedelta(minutes=float(min_lead_minutes))
+        )
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.* FROM matches m
+                WHERE m.status='open'
+                  AND m.live=0
+                  AND m.ended=0
+                  AND m.liquidity >= ?
+                  AND m.scheduled_at IS NOT NULL
+                  AND m.scheduled_at >= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM shadow_panel_runs r
+                      WHERE r.match_id=m.match_id
+                        AND r.panel_version=?
+                        AND r.model=?
+                        AND r.backend=?
+                  )
+                ORDER BY m.scheduled_at ASC, m.liquidity DESC
+                LIMIT ?
+                """,
+                (
+                    float(min_liquidity),
+                    cutoff,
+                    panel_version,
+                    model,
+                    backend,
+                    int(limit),
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def begin_shadow_panel_run(
+        self,
+        match_id: str,
+        evidence_cutoff_at: str,
+        panel_version: str,
+        provider: str,
+        model: str,
+        backend: str,
+        grounded_teams: int,
+    ) -> Optional[int]:
+        """Reserve one panel cohort, returning ``None`` on a concurrent claim."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO shadow_panel_runs(
+                    match_id, created_at, evidence_cutoff_at, panel_version,
+                    provider, model, backend, grounded_teams, applied
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    match_id,
+                    isoformat(utc_now()),
+                    evidence_cutoff_at,
+                    panel_version,
+                    provider,
+                    model,
+                    backend,
+                    int(grounded_teams),
+                ),
+            )
+            return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def record_shadow_panel_member(
+        self,
+        run_id: int,
+        role: str,
+        prompt_sha256: str,
+        parsed: Dict[str, Any],
+    ) -> int:
+        usage = parsed.get("usage") or {}
+        probability = float(parsed["probability_team_a"])
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO shadow_panel_members(
+                    run_id, role, created_at, status, prompt_sha256,
+                    probability_a, raw_probability_a, confidence,
+                    reasoning_summary, key_factors_json, evidence_json,
+                    assumptions_json, raw_response, usage_json,
+                    estimated_cost_usd, error, applied
+                ) VALUES(?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0)
+                """,
+                (
+                    int(run_id),
+                    role,
+                    isoformat(utc_now()),
+                    prompt_sha256,
+                    probability,
+                    float(parsed.get("raw_probability_team_a", probability)),
+                    parsed.get("confidence", "low"),
+                    parsed.get("reasoning_summary", ""),
+                    _json(parsed.get("key_factors") or []),
+                    _json(parsed.get("supporting_evidence") or []),
+                    _json(parsed.get("assumptions") or []),
+                    str(parsed.get("raw_response") or ""),
+                    _json(usage),
+                    float(usage.get("estimated_cost_usd", 0.0) or 0.0),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def record_shadow_panel_member_error(
+        self,
+        run_id: int,
+        role: str,
+        prompt_sha256: str,
+        error: str,
+        usage: Dict[str, Any],
+        raw_response: str = "",
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO shadow_panel_members(
+                    run_id, role, created_at, status, prompt_sha256,
+                    raw_response, usage_json, estimated_cost_usd, error, applied
+                ) VALUES(?, ?, ?, 'failed', ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    int(run_id),
+                    role,
+                    isoformat(utc_now()),
+                    prompt_sha256,
+                    str(raw_response or ""),
+                    _json(usage),
+                    float(usage.get("estimated_cost_usd", 0.0) or 0.0),
+                    str(error)[:4000],
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_shadow_panel_run(
+        self,
+        run_id: int,
+        status: str,
+        consensus: Optional[Dict[str, float]],
+        market_probability_a: Optional[float],
+        market_captured_at: Optional[str],
+        usage: Dict[str, Any],
+        errors: List[str],
+    ) -> None:
+        if status not in ("completed", "partial", "failed"):
+            raise ValueError("invalid shadow panel status")
+        value = consensus or {}
+        with self.connect() as connection:
+            successful = int(
+                connection.execute(
+                    """
+                    SELECT count(*) FROM shadow_panel_members
+                    WHERE run_id=? AND status='completed'
+                    """,
+                    (int(run_id),),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                UPDATE shadow_panel_runs
+                SET completed_at=?, status=?, successful_members=?,
+                    consensus_probability_a=?, uncertainty_low_a=?,
+                    uncertainty_high_a=?, probability_spread=?, probability_mad=?,
+                    market_probability_a=?, market_captured_at=?, usage_json=?,
+                    estimated_cost_usd=?, errors_json=?, applied=0
+                WHERE run_id=?
+                """,
+                (
+                    isoformat(utc_now()),
+                    status,
+                    successful,
+                    value.get("probability_a"),
+                    value.get("uncertainty_low_a"),
+                    value.get("uncertainty_high_a"),
+                    value.get("spread"),
+                    value.get("mad"),
+                    market_probability_a,
+                    market_captured_at,
+                    _json(usage),
+                    float(usage.get("estimated_cost_usd", 0.0) or 0.0),
+                    _json(errors),
+                    int(run_id),
+                ),
+            )
+
+    def count_shadow_panel_runs_since(self, since: str) -> int:
+        with self.connect() as connection:
+            return int(
+                connection.execute(
+                    "SELECT count(*) FROM shadow_panel_runs WHERE created_at >= ?",
+                    (since,),
+                ).fetchone()[0]
+            )
+
+    def shadow_panel_cost_since(self, since: str) -> float:
+        with self.connect() as connection:
+            return float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(sum(estimated_cost_usd), 0)
+                    FROM shadow_panel_runs WHERE created_at >= ?
+                    """,
+                    (since,),
+                ).fetchone()[0]
+            )
+
+    def latest_shadow_panel_run(self, match_id: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM shadow_panel_runs WHERE match_id=?
+                ORDER BY created_at DESC, run_id DESC LIMIT 1
+                """,
+                (match_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            members = connection.execute(
+                """
+                SELECT * FROM shadow_panel_members
+                WHERE run_id=? ORDER BY member_id
+                """,
+                (int(row["run_id"]),),
+            ).fetchall()
+        result = dict(row)
+        result["usage"] = json.loads(result.pop("usage_json") or "{}")
+        result["errors"] = json.loads(result.pop("errors_json") or "[]")
+        result["members"] = []
+        for member_row in members:
+            member = dict(member_row)
+            member["key_factors"] = json.loads(member.pop("key_factors_json") or "[]")
+            member["evidence"] = json.loads(member.pop("evidence_json") or "[]")
+            member["assumptions"] = json.loads(member.pop("assumptions_json") or "[]")
+            member["usage"] = json.loads(member.pop("usage_json") or "{}")
+            result["members"].append(member)
+        return result
+
     def start_collector_run(self) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -2208,10 +2635,25 @@ class Database:
         return account_dict
 
     def strategy_summary(self, account_name: str = "live-paper") -> List[Dict[str, Any]]:
-        """Independent decision and PnL attribution for each signal horizon."""
+        """Depth-sim activity funnel and PnL attribution by information horizon.
+
+        Forecast eligibility is global because forecasts are shared model
+        observations. Signals onward are account-specific. ``decisions`` is a
+        compatibility alias for ``paper_enabled``; the dashboard uses the
+        explicit funnel names so a forecast, an order and a fill are never
+        presented as though they were the same event.
+        """
         summary: Dict[str, Dict[str, Any]] = {
             strategy: {
                 "strategy": strategy,
+                "scope": "depth-sim",
+                "forecasts": 0,
+                "paper_enabled": 0,
+                "entry_enabled": 0,
+                "signals": 0,
+                "orders": 0,
+                "fills": 0,
+                # Kept for API compatibility with the pre-funnel dashboard.
                 "decisions": 0,
                 "trades": 0,
                 "buys": 0,
@@ -2229,13 +2671,22 @@ class Database:
         with self.connect() as connection:
             for row in connection.execute(
                 """
-                SELECT strategy, count(*) AS n FROM forecasts
-                WHERE paper_enabled=1 AND execution_mode='depth-sim'
+                SELECT strategy,
+                       count(*) AS forecasts,
+                       sum(CASE WHEN paper_enabled=1 THEN 1 ELSE 0 END)
+                           AS paper_enabled,
+                       sum(CASE WHEN entry_enabled=1 THEN 1 ELSE 0 END)
+                           AS entry_enabled
+                FROM forecasts
+                WHERE execution_mode='depth-sim'
                 GROUP BY strategy
                 """
             ).fetchall():
                 if row["strategy"] in summary:
-                    summary[row["strategy"]]["decisions"] = int(row["n"])
+                    item = summary[row["strategy"]]
+                    for key in ("forecasts", "paper_enabled", "entry_enabled"):
+                        item[key] = int(row[key] or 0)
+                    item["decisions"] = item["paper_enabled"]
 
             account = connection.execute(
                 "SELECT account_id FROM paper_accounts WHERE name=?", (account_name,)
@@ -2243,6 +2694,36 @@ class Database:
             if account is None:
                 return [summary[strategy] for strategy in STRATEGIES]
             account_id = int(account["account_id"])
+
+            for row in connection.execute(
+                """
+                SELECT decision_strategy,
+                       count(DISTINCT forecast_id) AS signals,
+                       count(*) AS orders
+                FROM paper_orders
+                WHERE account_id=? AND execution_mode='depth-sim'
+                GROUP BY decision_strategy
+                """,
+                (account_id,),
+            ).fetchall():
+                item = summary.get(row["decision_strategy"])
+                if item is not None:
+                    item["signals"] = int(row["signals"] or 0)
+                    item["orders"] = int(row["orders"] or 0)
+
+            for row in connection.execute(
+                """
+                SELECT o.decision_strategy, count(*) AS fills
+                FROM paper_fills pf
+                JOIN paper_orders o ON o.order_id=pf.order_id
+                WHERE o.account_id=? AND o.execution_mode='depth-sim'
+                GROUP BY o.decision_strategy
+                """,
+                (account_id,),
+            ).fetchall():
+                item = summary.get(row["decision_strategy"])
+                if item is not None:
+                    item["fills"] = int(row["fills"] or 0)
 
             for row in connection.execute(
                 """

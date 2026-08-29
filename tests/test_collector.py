@@ -193,7 +193,7 @@ class CollectorTests(unittest.TestCase):
         self.assertFalse(result.forecasts[0]["entry_enabled"])
         self.assertIn(collector_module.ROUND_FEED_NOTICE, result.notices)
         self.assertEqual(self.db.dashboard_payload()["counts"]["trades"], 0)
-        self.assertEqual(result.forecasts[0]["strategy"], "map-boundary")
+        self.assertEqual(result.forecasts[0]["strategy"], "maps-only-degraded")
         self.assertEqual(result.feed_health["round_coverage"], 0.0)
 
     def test_round_regression_is_frozen_paused_and_audited(self):

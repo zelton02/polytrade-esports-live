@@ -5,7 +5,7 @@ from pathlib import Path
 
 from polytrade_esports.storage import Database
 from polytrade_esports.timeutil import isoformat, utc_now
-from polytrade_esports.types import LiveState, Match
+from polytrade_esports.types import BookQuote, LiveState, Match
 
 
 class StorageTests(unittest.TestCase):
@@ -70,12 +70,150 @@ class StorageTests(unittest.TestCase):
             forecast_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(forecasts)")
             }
-        self.assertEqual(version, "6")
+        self.assertEqual(version, "7")
         self.assertTrue(
             {"paper_orders", "paper_fills", "order_book_levels",
              "execution_controls", "executor_status"}.issubset(tables)
         )
         self.assertIn("execution_mode", forecast_columns)
+
+    def test_maps_only_backfill_preserves_real_boundary_and_splits_repeats(self):
+        def forecast(stamp, state, strategy, execution_mode="depth-sim"):
+            state_id = self.db.record_state(state)
+            book_id = self.db.record_book(
+                BookQuote(
+                    "m1", 0.45, 0.46, 0.53, 0.54,
+                    source_at=stamp, observed_at=stamp,
+                )
+            )
+            return self.db.record_forecast(
+                match_id="m1",
+                state_id=state_id,
+                book_id=book_id,
+                forecast_at=stamp,
+                model_version="migration-test",
+                probability_a=0.6,
+                market_midpoint_a=0.455,
+                edge_a=0.14,
+                edge_b=-0.14,
+                best_side="A",
+                breakdown={},
+                strategy=strategy,
+                paper_enabled=True,
+                entry_enabled=strategy != "map-boundary",
+                execution_mode=execution_mode,
+            )
+
+        first = "2026-08-27T00:00:00Z"
+        boundary = "2026-08-27T00:01:00Z"
+        repeated = "2026-08-27T00:02:00Z"
+        legacy = "2026-08-27T00:03:00Z"
+        forecast(
+            first,
+            LiveState(
+                "m1", first, 0, 0, 12, 8, current_map="Map 1",
+                source="polymarket-sports-ws", observed_at=first,
+            ),
+            "round-live",
+        )
+        forecast(
+            boundary,
+            LiveState(
+                "m1", boundary, 1, 0, 0, 0, current_map="Map 2",
+                source="polymarket-sports-ws-maps", observed_at=boundary,
+            ),
+            "map-boundary",
+        )
+        forecast(
+            repeated,
+            LiveState(
+                "m1", repeated, 1, 0, 0, 0, current_map="Map 2",
+                source="polymarket-sports-ws-maps", observed_at=repeated,
+            ),
+            "map-boundary",
+        )
+        forecast(
+            legacy,
+            LiveState(
+                "m1", legacy, 1, 0, 0, 0, current_map="Map 2",
+                source="polymarket-sports-ws-maps", observed_at=legacy,
+            ),
+            "map-boundary",
+            execution_mode="legacy",
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key='backfill_maps_only_degraded_v1'"
+            )
+
+        self.db.initialize()
+
+        with self.db.connect() as connection:
+            strategies = [
+                (row[0], row[1])
+                for row in connection.execute(
+                    "SELECT strategy, execution_mode FROM forecasts "
+                    "ORDER BY forecast_at"
+                ).fetchall()
+            ]
+        self.assertEqual(
+            strategies,
+            [
+                ("round-live", "depth-sim"),
+                ("map-boundary", "depth-sim"),
+                ("maps-only-degraded", "depth-sim"),
+                ("map-boundary", "legacy"),
+            ],
+        )
+        self.assertEqual(
+            sum(item["forecasts"] for item in self.db.strategy_summary()),
+            3,
+        )
+
+    def test_maps_only_backfill_does_not_guess_first_degraded_forecast(self):
+        stamp = "2026-08-27T00:00:00Z"
+        state_id = self.db.record_state(
+            LiveState(
+                "m1", stamp, 1, 0, 0, 0, current_map="Map 2",
+                source="polymarket-sports-ws-maps", observed_at=stamp,
+            )
+        )
+        book_id = self.db.record_book(
+            BookQuote(
+                "m1", 0.45, 0.46, 0.53, 0.54,
+                source_at=stamp, observed_at=stamp,
+            )
+        )
+        forecast_id = self.db.record_forecast(
+            match_id="m1",
+            state_id=state_id,
+            book_id=book_id,
+            forecast_at=stamp,
+            model_version="migration-test",
+            probability_a=0.6,
+            market_midpoint_a=0.455,
+            edge_a=0.14,
+            edge_b=-0.14,
+            best_side="A",
+            breakdown={},
+            strategy="map-boundary",
+            paper_enabled=True,
+            entry_enabled=False,
+            execution_mode="depth-sim",
+        )
+        with self.db.connect() as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key='backfill_maps_only_degraded_v1'"
+            )
+
+        self.db.initialize()
+
+        with self.db.connect() as connection:
+            strategy = connection.execute(
+                "SELECT strategy FROM forecasts WHERE forecast_id=?",
+                (forecast_id,),
+            ).fetchone()[0]
+        self.assertEqual(strategy, "map-boundary")
 
 
 if __name__ == "__main__":
